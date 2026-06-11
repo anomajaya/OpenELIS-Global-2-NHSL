@@ -28,6 +28,7 @@ nav:
        - Examples of FHIR messages used: messages.md
        - Deploy Consolidated Server: csbuild.md
        - Setup High Availability Failover: failover.md
+       - Setting Up a Local NTP Time Server: ntp-time-server.md
     - Develop: 
        - Dev Environment Setup Instructions: dev_setup.md
        - Developers Notes: dev.md
