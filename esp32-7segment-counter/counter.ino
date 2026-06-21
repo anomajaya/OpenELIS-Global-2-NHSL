@@ -181,13 +181,16 @@ void setup() {
 
   ledcAttach(BUZZER_PIN, 2800, 8);
   ledcWrite(BUZZER_PIN, 0);
+
+  Serial.begin(115200);
+  Serial.println("Boot OK");
 }
 
 void loop() {
   updateDisplay();
   beepTick();
 
-  if (checkPress(btnInc)) { if (counter < COUNT_MAX) counter++; beepStart(); }
-  if (checkPress(btnDec)) { if (counter > COUNT_MIN) counter--; beepStart(); }
-  if (checkPress(btnRst)) { counter = COUNT_MIN; beepStart(); }
+  if (checkPress(btnInc)) { if (counter < COUNT_MAX) counter++; beepStart(); Serial.printf("INC → %d\n", counter); }
+  if (checkPress(btnDec)) { if (counter > COUNT_MIN) counter--; beepStart(); Serial.printf("DEC → %d\n", counter); }
+  if (checkPress(btnRst)) { counter = COUNT_MIN; beepStart(); Serial.println("RST → 0"); }
 }
