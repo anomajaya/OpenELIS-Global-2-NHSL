@@ -11,54 +11,41 @@
  *   GPIO 18 → 150Ω → Seg e  │
  *   GPIO 19 → 150Ω → Seg f  │
  *   GPIO 21 → 150Ω → Seg g  ┘
- *
  *   GPIO 22 → 1kΩ → BC547 Q1 base; Q1 collector → COM1 pin 15 (TENS  digit)
  *   GPIO 23 → 1kΩ → BC547 Q2 base; Q2 collector → COM2 pin 6  (UNITS digit)
- *   Q1, Q2 emitters → GND
- *
  *   GPIO 25 → BTN_INC → GND  (INPUT_PULLUP)
  *   GPIO 26 → BTN_DEC → GND  (INPUT_PULLUP)
  *   GPIO 27 → BTN_RST → GND  (INPUT_PULLUP)
- *
  *   GPIO 4  → 150Ω → Passive Buzzer (+) → GND
- *   Power   : 3.3V + GND from DevKit board
- *
- * MLN5241RK pinout (common cathode, view from front):
- *   Seg a : pin 8  (or 17)    COM1 (tens,  left  digit): pin 15
- *   Seg b : pin 7  (or 16)    COM2 (units, right digit): pin 6
- *   Seg c : pin 4  (or 13)    DP (decimal): pins 3,12 — leave unconnected
- *   Seg d : pin 2  (or 11)
- *   Seg e : pin 1  (or 10)
- *   Seg f : pin 9  (or 18)
- *   Seg g : pin 5  (or 14)
- *   (Connect either pin of each mirrored pair — both sides are identical)
- *
- * Pins deliberately avoided (ESP32 strapping / flash pins):
- *   GPIO 0, 2, 5, 12, 15  — strapping pins (affect boot mode)
- *   GPIO 6–11              — internal flash (never use)
- *   GPIO 34–39             — input-only
- *
- * Arduino IDE board setting: "ESP32 Dev Module"
  */
 
-// ── Segment pins (a → g) ──────────────────────────────────────────────────────
+// ── Structs first — Arduino IDE auto-generates prototypes before any code,
+//    so structs used in function signatures must be declared at the top. ───────
 
-const uint8_t SEG_PINS[7] = {13, 14, 16, 17, 18, 19, 21};
+struct BeepPhase {
+  uint32_t freq;
+  uint32_t ms;
+};
 
-// ── Digit select (HIGH = NPN transistor ON = digit cathode sunk to GND) ───────
+struct Button {
+  uint8_t  pin;
+  bool     lastReading;
+  bool     stableState;
+  uint32_t lastChangeMs;
+};
 
-const uint8_t DIGIT_TENS  = 22;
-const uint8_t DIGIT_UNITS = 23;
+// ── Pin definitions ───────────────────────────────────────────────────────────
 
-// ── Button pins (INPUT_PULLUP — press connects to GND = LOW) ─────────────────
+const uint8_t SEG_PINS[7]  = {13, 14, 16, 17, 18, 19, 21}; // a, b, c, d, e, f, g
 
-const uint8_t BTN_INC = 25;
-const uint8_t BTN_DEC = 26;
-const uint8_t BTN_RST = 27;
+const uint8_t DIGIT_TENS   = 22;
+const uint8_t DIGIT_UNITS  = 23;
 
-// ── Buzzer ────────────────────────────────────────────────────────────────────
+const uint8_t BTN_INC      = 25;
+const uint8_t BTN_DEC      = 26;
+const uint8_t BTN_RST      = 27;
 
-const uint8_t BUZZER_PIN = 4;
+const uint8_t BUZZER_PIN   = 4;
 
 // ── 7-segment encoding ────────────────────────────────────────────────────────
 // Common cathode: bit HIGH = segment ON
@@ -92,25 +79,15 @@ const int COUNT_MIN =  0;
 int counter = 0;
 
 // ── Buzzer — non-blocking AC-remote two-phase beep ────────────────────────────
-//
-// Matches the "tick-beep" of Daikin / Mitsubishi / Panasonic AC remotes:
-//   Phase 0: 3800 Hz, 25 ms — sharp high-pitched attack (the "tick")
-//   Phase 1:    0 Hz,  5 ms — brief silence gap
-//   Phase 2: 2800 Hz, 60 ms — warm body tone  (the "beep")
-//
-// Uses ESP32 LEDC hardware timer — completely non-blocking so display
-// multiplexing continues uninterrupted during the beep.
-
-struct BeepPhase { uint32_t freq; uint32_t ms; };
 
 const BeepPhase BEEP_SEQ[] = {
-  {3800, 25},
-  {   0,  5},
-  {2800, 60},
+  {3800, 25},  // sharp attack
+  {   0,  5},  // brief silence
+  {2800, 60},  // warm body tone
 };
 const int BEEP_PHASES = sizeof(BEEP_SEQ) / sizeof(BEEP_SEQ[0]);
 
-int      beepPhase   = -1;   // -1 = idle
+int      beepPhase   = -1;
 uint32_t beepPhaseMs =  0;
 
 void beepStart() {
@@ -137,18 +114,10 @@ void beepTick() {
 
 const uint32_t DEBOUNCE_MS = 50;
 
-struct Button {
-  uint8_t  pin;
-  bool     lastReading;
-  bool     stableState;
-  uint32_t lastChangeMs;
-};
-
 Button btnInc = {BTN_INC, HIGH, HIGH, 0};
 Button btnDec = {BTN_DEC, HIGH, HIGH, 0};
 Button btnRst = {BTN_RST, HIGH, HIGH, 0};
 
-// Returns true exactly once per physical press (debounced falling edge).
 bool checkPress(Button &btn) {
   bool     r   = digitalRead(btn.pin);
   uint32_t now = millis();
@@ -177,12 +146,10 @@ void clearSegments() {
   for (int i = 0; i < 7; i++) digitalWrite(SEG_PINS[i], LOW);
 }
 
-// Call every loop iteration — switches active digit every MUX_US microseconds.
 void updateDisplay() {
   if (micros() - lastMuxUs < MUX_US) return;
   lastMuxUs = micros();
 
-  // Blank both digits before switching to prevent ghosting.
   digitalWrite(DIGIT_TENS,  LOW);
   digitalWrite(DIGIT_UNITS, LOW);
   clearSegments();
@@ -212,14 +179,13 @@ void setup() {
   pinMode(BTN_DEC, INPUT_PULLUP);
   pinMode(BTN_RST, INPUT_PULLUP);
 
-  // Buzzer via ESP32 LEDC hardware PWM (core 3.x API)
-  ledcAttach(BUZZER_PIN, 2800, 8);  // pin, initial freq, 8-bit resolution
-  ledcWrite(BUZZER_PIN, 0);         // silent at start
+  ledcAttach(BUZZER_PIN, 2800, 8);
+  ledcWrite(BUZZER_PIN, 0);
 }
 
 void loop() {
-  updateDisplay();   // must run every iteration for flicker-free multiplexing
-  beepTick();        // advances beep state machine without blocking
+  updateDisplay();
+  beepTick();
 
   if (checkPress(btnInc)) { if (counter < COUNT_MAX) counter++; beepStart(); }
   if (checkPress(btnDec)) { if (counter > COUNT_MIN) counter--; beepStart(); }
