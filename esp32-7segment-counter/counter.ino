@@ -200,6 +200,22 @@ void setup() {
   Serial.printf("Pin states: INC=%d DEC=%d RST=%d\n",
                 digitalRead(BTN_INC), digitalRead(BTN_DEC), digitalRead(BTN_RST));
   Serial.println("(1=idle  0=stuck-low or pressed)");
+
+  // ── Segment scan: light each GPIO one at a time for 800 ms ──────────────
+  // Enable both digit drivers so you can see which physical segment lights up
+  digitalWrite(DIGIT_TENS,  HIGH);
+  digitalWrite(DIGIT_UNITS, HIGH);
+  const char* segNames[7] = {"a(top)","b(upper-R)","c(lower-R)","d(bottom)","e(lower-L)","f(upper-L)","g(middle)"};
+  for (int i = 0; i < 7; i++) {
+    Serial.printf("SEG %s  GPIO %d\n", segNames[i], SEG_PINS[i]);
+    digitalWrite(SEG_PINS[i], HIGH);
+    delay(800);
+    digitalWrite(SEG_PINS[i], LOW);
+    delay(200);
+  }
+  digitalWrite(DIGIT_TENS,  LOW);
+  digitalWrite(DIGIT_UNITS, LOW);
+  Serial.println("Scan done — counter starting");
 }
 
 void loop() {
