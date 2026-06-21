@@ -14,8 +14,8 @@
  *   GPIO 22 → 1kΩ → BC547 Q1 base; Q1 collector → COM1 pin 15 (TENS  digit)
  *   GPIO 23 → 1kΩ → BC547 Q2 base; Q2 collector → COM2 pin 6  (UNITS digit)
  *   GPIO 25 → BTN_INC → GND  (INPUT_PULLUP)
- *   GPIO 26 → BTN_DEC → GND  (INPUT_PULLUP)
- *   GPIO 27 → BTN_RST → GND  (INPUT_PULLUP)
+ *   GPIO 32 → BTN_DEC → GND  (INPUT_PULLUP)
+ *   GPIO 33 → BTN_RST → GND  (INPUT_PULLUP)
  *   GPIO 4  → 150Ω → Passive Buzzer (+) → GND
  */
 
@@ -42,8 +42,8 @@ const uint8_t DIGIT_TENS   = 22;
 const uint8_t DIGIT_UNITS  = 23;
 
 const uint8_t BTN_INC      = 25;
-const uint8_t BTN_DEC      = 26;
-const uint8_t BTN_RST      = 27;
+const uint8_t BTN_DEC      = 32;
+const uint8_t BTN_RST      = 33;
 
 const uint8_t BUZZER_PIN   = 4;
 
