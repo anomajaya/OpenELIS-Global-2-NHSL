@@ -1,48 +1,59 @@
 /*
- * 2-Digit 7-Segment LED Counter (0–30) for ESP32-WROOM-32
- * With AC-remote-style passive buzzer feedback
+ * 2-Digit 7-Segment LED Counter (0–30)
+ * NodeMCU v3 — ESP8266 (ESP-12E / ESP8266MOD)
+ * Display: MLN5241RK (2-digit, common cathode, red)
  *
  * Wiring:
- *   Segments a–g  : GPIO 13, 14, 16, 17, 18, 19, 21  (each via 150Ω resistor)
- *   Tens  digit   : GPIO 22  → 1kΩ → BC547 base  (collector → Display 1 COM → GND)
- *   Units digit   : GPIO 23  → 1kΩ → BC547 base  (collector → Display 2 COM → GND)
- *   INC  button   : GPIO 25  → GND  (uses internal pull-up)
- *   DEC  button   : GPIO 26  → GND  (uses internal pull-up)
- *   RST  button   : GPIO 27  → GND  (uses internal pull-up)
- *   Passive buzzer: GPIO 4   → Buzzer (+) ; Buzzer (–) → GND
- *   Power         : 3.3V + GND from ESP32 DevKit
+ *   74HC595 SER   ← D7  (GPIO13, SPI MOSI)
+ *   74HC595 SRCLK ← D5  (GPIO14, SPI CLK)
+ *   74HC595 RCLK  ← D8  (GPIO15, SPI CS)  — has 10kΩ pull-down, starts LOW ✓
+ *   74HC595 VCC   → 3.3V  |  GND → GND
+ *   74HC595 OE    → GND   (output always enabled)
+ *   74HC595 SRCLR → 3.3V  (clear disabled)
+ *   74HC595 Q0–Q6 → 150Ω → Display seg a–g (both digits share)
  *
- * Display type: Common Cathode
- * Buzzer type : Passive (magnetic/piezo). Active buzzers will NOT work here
- *               because we need frequency control for the AC-remote tone.
+ *   D3 (GPIO0)  → 1kΩ → BC547 Q1 → COM1 pin 15 (TENS  digit)
+ *   D4 (GPIO2)  → 1kΩ → BC547 Q2 → COM2 pin 6  (UNITS digit)
  *
- * Arduino-ESP32 core compatibility:
- *   Core 3.x (current): uses ledcAttach(pin, freq, resolution)
- *   Core 2.x (legacy) : comment out the 3.x block, uncomment the 2.x block
- *                        in setup() and beepTick().
+ *   D1 (GPIO5)  → BTN_INC → GND  (INPUT_PULLUP)
+ *   D2 (GPIO4)  → BTN_DEC → GND  (INPUT_PULLUP)
+ *   D0 (GPIO16) → BTN_RST → GND  + 10kΩ from D0 to 3.3V  ← mandatory!
+ *
+ *   D6 (GPIO12) → 150Ω → Passive Buzzer (+) → GND
+ *
+ * BOOT NOTES:
+ *   GPIO0 (D3) & GPIO2 (D4) have hardware pull-ups → transistors briefly ON
+ *   at power-on until setup() clears them. This is harmless (a flicker).
+ *   Do NOT hold the INC button (D3) while powering on — it enters flash mode.
+ *
+ * Arduino IDE board setting: "NodeMCU 1.0 (ESP-12E Module)"
  */
 
+#include <SPI.h>
+
 // ── Pin definitions ───────────────────────────────────────────────────────────
+// NodeMCU GPIO numbers (not D-label numbers)
 
-const uint8_t SEG_PINS[7] = {13, 14, 16, 17, 18, 19, 21}; // a, b, c, d, e, f, g
+#define PIN_LATCH    15   // D8 — 74HC595 RCLK
+// SPI MOSI = GPIO13 (D7), SPI CLK = GPIO14 (D5) — set by SPI.begin()
 
-const uint8_t DIGIT_TENS  = 22;
-const uint8_t DIGIT_UNITS = 23;
+#define DIGIT_TENS    0   // D3 — GPIO0  (tens  digit transistor)
+#define DIGIT_UNITS   2   // D4 — GPIO2  (units digit transistor)
 
-const uint8_t BTN_INC    = 25;
-const uint8_t BTN_DEC    = 26;
-const uint8_t BTN_RST    = 27;
+#define BTN_INC       5   // D1 — GPIO5  (INPUT_PULLUP)
+#define BTN_DEC       4   // D2 — GPIO4  (INPUT_PULLUP)
+#define BTN_RST      16   // D0 — GPIO16 (INPUT — no internal pull-up, needs 10kΩ external)
 
-const uint8_t BUZZER_PIN = 4;
+#define BUZZER_PIN   12   // D6 — GPIO12 (PWM capable)
 
 // ── 7-segment encoding ────────────────────────────────────────────────────────
+// 74HC595 Q0=a, Q1=b, Q2=c, Q3=d, Q4=e, Q5=f, Q6=g, Q7=NC
 // Common cathode: bit HIGH = segment ON
-// Bit position: 6=g, 5=f, 4=e, 3=d, 2=c, 1=b, 0=a
 //
 //   _
 //  |_|   a=top, b=top-right, c=bot-right, d=bottom
 //  |_|   e=bot-left, f=top-left, g=middle
-//
+
 const uint8_t SEG_MAP[10] = {
   0x3F, // 0: a b c d e f  ·
   0x06, // 1: · b c · · ·  ·
@@ -60,58 +71,48 @@ const uint8_t SEG_MAP[10] = {
 
 const int COUNT_MAX = 30;
 const int COUNT_MIN =  0;
-
 int counter = 0;
 
-// ── Passive buzzer — non-blocking AC-remote beep ──────────────────────────────
+// ── Buzzer — non-blocking AC-remote two-phase beep ────────────────────────────
 //
-// AC remote control sound profile:
-//   Tone 1 (click) : 3800 Hz, 25 ms  — high-pitched attack
-//   Tone 2 (body)  : 2800 Hz, 60 ms  — warm body tone
-//   Gap between    :    5 ms silence
-//
-// This two-phase shape matches the characteristic "tick-beep" of most
-// Daikin / Mitsubishi / Panasonic AC remote controls.
+// Phase 0: 3800 Hz, 25 ms — sharp high-pitched attack
+// Phase 1:    0 Hz,  5 ms — brief silence
+// Phase 2: 2800 Hz, 60 ms — warm body tone
+// Matches the "tick-beep" of Daikin/Mitsubishi/Panasonic AC remotes.
 
-struct BeepPhase {
-  uint32_t freq;        // Hz  (0 = silence)
-  uint32_t durationMs;
+struct BeepPhase { uint32_t freq; uint32_t ms; };
+
+const BeepPhase BEEP_SEQ[] = {
+  {3800, 25},
+  {   0,  5},
+  {2800, 60},
 };
+const int BEEP_PHASES = sizeof(BEEP_SEQ) / sizeof(BEEP_SEQ[0]);
 
-const BeepPhase BEEP_SEQUENCE[] = {
-  {3800, 25},  // phase 0: sharp attack
-  {   0,  5},  // phase 1: brief silence
-  {2800, 60},  // phase 2: warm body
-};
-const int BEEP_PHASES = sizeof(BEEP_SEQUENCE) / sizeof(BEEP_SEQUENCE[0]);
+int      beepPhase   = -1;   // -1 = idle
+uint32_t beepPhaseMs =  0;
 
-int      beepPhase      = -1;   // -1 = idle
-uint32_t beepPhaseStart =  0;
-
-// Start a fresh beep sequence (safe to call even if a beep is in progress).
 void beepStart() {
-  beepPhase      = 0;
-  beepPhaseStart = millis();
-  ledcWriteTone(BUZZER_PIN, BEEP_SEQUENCE[0].freq);  // ESP32 core 3.x
-  // Core 2.x: ledcWriteTone(0, BEEP_SEQUENCE[0].freq);
+  beepPhase   = 0;
+  beepPhaseMs = millis();
+  tone(BUZZER_PIN, BEEP_SEQ[0].freq);
 }
 
-// Advance the beep state machine — call every loop iteration.
 void beepTick() {
   if (beepPhase < 0) return;
+  if (millis() - beepPhaseMs < BEEP_SEQ[beepPhase].ms) return;
 
-  if ((millis() - beepPhaseStart) >= BEEP_SEQUENCE[beepPhase].durationMs) {
-    beepPhase++;
-    if (beepPhase >= BEEP_PHASES) {
-      ledcWriteTone(BUZZER_PIN, 0);  // ESP32 core 3.x
-      // Core 2.x: ledcWriteTone(0, 0);
-      beepPhase = -1;
-      return;
-    }
-    beepPhaseStart = millis();
-    ledcWriteTone(BUZZER_PIN, BEEP_SEQUENCE[beepPhase].freq);  // core 3.x
-    // Core 2.x: ledcWriteTone(0, BEEP_SEQUENCE[beepPhase].freq);
+  beepPhase++;
+  if (beepPhase >= BEEP_PHASES) {
+    noTone(BUZZER_PIN);
+    beepPhase = -1;
+    return;
   }
+  beepPhaseMs = millis();
+  if (BEEP_SEQ[beepPhase].freq > 0)
+    tone(BUZZER_PIN, BEEP_SEQ[beepPhase].freq);
+  else
+    noTone(BUZZER_PIN);
 }
 
 // ── Button debounce ───────────────────────────────────────────────────────────
@@ -129,98 +130,77 @@ Button btnInc = {BTN_INC, HIGH, HIGH, 0};
 Button btnDec = {BTN_DEC, HIGH, HIGH, 0};
 Button btnRst = {BTN_RST, HIGH, HIGH, 0};
 
-// Returns true exactly once per physical press (falling edge, debounced).
+// Returns true exactly once per physical press (debounced falling edge).
 bool checkPress(Button &btn) {
-  bool reading = digitalRead(btn.pin);
+  bool     r   = digitalRead(btn.pin);
   uint32_t now = millis();
-
-  if (reading != btn.lastReading) {
-    btn.lastChangeMs = now;
-    btn.lastReading  = reading;
-  }
-
-  if ((now - btn.lastChangeMs) >= DEBOUNCE_MS && btn.stableState != reading) {
-    btn.stableState = reading;
-    return (reading == LOW);
+  if (r != btn.lastReading) { btn.lastChangeMs = now; btn.lastReading = r; }
+  if (now - btn.lastChangeMs >= DEBOUNCE_MS && btn.stableState != r) {
+    btn.stableState = r;
+    return r == LOW;
   }
   return false;
 }
 
-// ── Display multiplexing ──────────────────────────────────────────────────────
+// ── Display multiplexing via 74HC595 ─────────────────────────────────────────
 
-const uint32_t MUX_US = 2000;  // 2 ms per digit → 250 Hz refresh
-
+const uint32_t MUX_US = 2000;   // 2 ms per digit → 250 Hz, no flicker
 uint32_t lastMuxUs = 0;
 bool     showTens  = true;
 
-void writeSegments(uint8_t digit) {
-  uint8_t enc = SEG_MAP[digit];
-  for (int i = 0; i < 7; i++) {
-    digitalWrite(SEG_PINS[i], (enc >> i) & 1);
-  }
+void shift595(uint8_t data) {
+  digitalWrite(PIN_LATCH, LOW);
+  SPI.transfer(data);
+  digitalWrite(PIN_LATCH, HIGH);
 }
 
-void clearSegments() {
-  for (int i = 0; i < 7; i++) digitalWrite(SEG_PINS[i], LOW);
-}
-
+// Call every loop iteration — switches active digit every MUX_US microseconds.
 void updateDisplay() {
-  if ((micros() - lastMuxUs) < MUX_US) return;
+  if (micros() - lastMuxUs < MUX_US) return;
   lastMuxUs = micros();
 
+  // Blank both digits first to prevent ghosting on transistor switch.
   digitalWrite(DIGIT_TENS,  LOW);
   digitalWrite(DIGIT_UNITS, LOW);
-  clearSegments();
+  shift595(0x00);
 
   if (showTens) {
-    writeSegments(counter / 10);
+    shift595(SEG_MAP[counter / 10]);
     digitalWrite(DIGIT_TENS, HIGH);
   } else {
-    writeSegments(counter % 10);
+    shift595(SEG_MAP[counter % 10]);
     digitalWrite(DIGIT_UNITS, HIGH);
   }
-
   showTens = !showTens;
 }
 
 // ── Setup & Loop ──────────────────────────────────────────────────────────────
 
 void setup() {
-  for (int i = 0; i < 7; i++) {
-    pinMode(SEG_PINS[i], OUTPUT);
-    digitalWrite(SEG_PINS[i], LOW);
-  }
+  // Hardware SPI: MOSI=D7(GPIO13), CLK=D5(GPIO14) assigned automatically
+  SPI.begin();
+  SPI.setFrequency(1000000);     // 1 MHz — well within 74HC595 max spec (25 MHz)
+  SPI.setDataMode(SPI_MODE0);
+
+  pinMode(PIN_LATCH, OUTPUT);
+  shift595(0x00);                // clear 595 at start
+
   pinMode(DIGIT_TENS,  OUTPUT); digitalWrite(DIGIT_TENS,  LOW);
   pinMode(DIGIT_UNITS, OUTPUT); digitalWrite(DIGIT_UNITS, LOW);
 
-  pinMode(BTN_INC, INPUT_PULLUP);
-  pinMode(BTN_DEC, INPUT_PULLUP);
-  pinMode(BTN_RST, INPUT_PULLUP);
+  pinMode(BTN_INC, INPUT_PULLUP);  // GPIO5 — internal pull-up available
+  pinMode(BTN_DEC, INPUT_PULLUP);  // GPIO4 — internal pull-up available
+  pinMode(BTN_RST, INPUT);         // GPIO16 — NO internal pull-up, needs external 10kΩ
 
-  // Buzzer — ESP32 core 3.x
-  ledcAttach(BUZZER_PIN, 2800, 8);  // pin, initial freq, 8-bit resolution
-  ledcWrite(BUZZER_PIN, 0);         // silent at start
-
-  // Buzzer — ESP32 core 2.x (uncomment if you get a compile error above)
-  // ledcSetup(0, 2800, 8);         // channel 0, freq, resolution
-  // ledcAttachPin(BUZZER_PIN, 0);
-  // ledcWrite(0, 0);
+  pinMode(BUZZER_PIN, OUTPUT);
+  noTone(BUZZER_PIN);
 }
 
 void loop() {
-  updateDisplay();  // must run every iteration for flicker-free multiplexing
-  beepTick();       // advances the beep state machine without blocking
+  updateDisplay();   // must run every iteration for flicker-free multiplexing
+  beepTick();        // advances beep state machine without blocking
 
-  if (checkPress(btnInc)) {
-    if (counter < COUNT_MAX) counter++;
-    beepStart();
-  }
-  if (checkPress(btnDec)) {
-    if (counter > COUNT_MIN) counter--;
-    beepStart();
-  }
-  if (checkPress(btnRst)) {
-    counter = COUNT_MIN;
-    beepStart();
-  }
+  if (checkPress(btnInc)) { if (counter < COUNT_MAX) counter++; beepStart(); }
+  if (checkPress(btnDec)) { if (counter > COUNT_MIN) counter--; beepStart(); }
+  if (checkPress(btnRst)) { counter = COUNT_MIN; beepStart(); }
 }
