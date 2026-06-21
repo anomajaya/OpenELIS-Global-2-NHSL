@@ -1,58 +1,76 @@
 /*
  * 2-Digit 7-Segment LED Counter (0–30)
- * NodeMCU v3 — ESP8266 (ESP-12E / ESP8266MOD)
+ * ESP32-WROOM-32 DevKitC (38-pin)
  * Display: MLN5241RK (2-digit, common cathode, red)
  *
  * Wiring:
- *   74HC595 SER   ← D7  (GPIO13, SPI MOSI)
- *   74HC595 SRCLK ← D5  (GPIO14, SPI CLK)
- *   74HC595 RCLK  ← D8  (GPIO15, SPI CS)  — has 10kΩ pull-down, starts LOW ✓
- *   74HC595 VCC   → 3.3V  |  GND → GND
- *   74HC595 OE    → GND   (output always enabled)
- *   74HC595 SRCLR → 3.3V  (clear disabled)
- *   74HC595 Q0–Q6 → 150Ω → Display seg a–g (both digits share)
+ *   GPIO 13 → 150Ω → Seg a  ┐
+ *   GPIO 14 → 150Ω → Seg b  │
+ *   GPIO 16 → 150Ω → Seg c  │ both digits share these segment lines
+ *   GPIO 17 → 150Ω → Seg d  │
+ *   GPIO 18 → 150Ω → Seg e  │
+ *   GPIO 19 → 150Ω → Seg f  │
+ *   GPIO 21 → 150Ω → Seg g  ┘
  *
- *   D3 (GPIO0)  → 1kΩ → BC547 Q1 → COM1 pin 15 (TENS  digit)
- *   D4 (GPIO2)  → 1kΩ → BC547 Q2 → COM2 pin 6  (UNITS digit)
+ *   GPIO 22 → 1kΩ → BC547 Q1 base; Q1 collector → COM1 pin 15 (TENS  digit)
+ *   GPIO 23 → 1kΩ → BC547 Q2 base; Q2 collector → COM2 pin 6  (UNITS digit)
+ *   Q1, Q2 emitters → GND
  *
- *   D1 (GPIO5)  → BTN_INC → GND  (INPUT_PULLUP)
- *   D2 (GPIO4)  → BTN_DEC → GND  (INPUT_PULLUP)
- *   D0 (GPIO16) → BTN_RST → GND  + 10kΩ from D0 to 3.3V  ← mandatory!
+ *   GPIO 25 → BTN_INC → GND  (INPUT_PULLUP)
+ *   GPIO 26 → BTN_DEC → GND  (INPUT_PULLUP)
+ *   GPIO 27 → BTN_RST → GND  (INPUT_PULLUP)
  *
- *   D6 (GPIO12) → 150Ω → Passive Buzzer (+) → GND
+ *   GPIO 4  → 150Ω → Passive Buzzer (+) → GND
+ *   Power   : 3.3V + GND from DevKit board
  *
- * BOOT NOTES:
- *   GPIO0 (D3) & GPIO2 (D4) have hardware pull-ups → transistors briefly ON
- *   at power-on until setup() clears them. This is harmless (a flicker).
- *   Do NOT hold the INC button (D3) while powering on — it enters flash mode.
+ * MLN5241RK pinout (common cathode, view from front):
+ *   Seg a : pin 8  (or 17)    COM1 (tens,  left  digit): pin 15
+ *   Seg b : pin 7  (or 16)    COM2 (units, right digit): pin 6
+ *   Seg c : pin 4  (or 13)    DP (decimal): pins 3,12 — leave unconnected
+ *   Seg d : pin 2  (or 11)
+ *   Seg e : pin 1  (or 10)
+ *   Seg f : pin 9  (or 18)
+ *   Seg g : pin 5  (or 14)
+ *   (Connect either pin of each mirrored pair — both sides are identical)
  *
- * Arduino IDE board setting: "NodeMCU 1.0 (ESP-12E Module)"
+ * Pins deliberately avoided (ESP32 strapping / flash pins):
+ *   GPIO 0, 2, 5, 12, 15  — strapping pins (affect boot mode)
+ *   GPIO 6–11              — internal flash (never use)
+ *   GPIO 34–39             — input-only
+ *
+ * Arduino IDE board setting: "ESP32 Dev Module"
  */
 
-#include <SPI.h>
+// ── Segment pins (a → g) ──────────────────────────────────────────────────────
 
-// ── Pin definitions ───────────────────────────────────────────────────────────
-// NodeMCU GPIO numbers (not D-label numbers)
+const uint8_t SEG_PINS[7] = {13, 14, 16, 17, 18, 19, 21};
 
-#define PIN_LATCH    15   // D8 — 74HC595 RCLK
-// SPI MOSI = GPIO13 (D7), SPI CLK = GPIO14 (D5) — set by SPI.begin()
+// ── Digit select (HIGH = NPN transistor ON = digit cathode sunk to GND) ───────
 
-#define DIGIT_TENS    0   // D3 — GPIO0  (tens  digit transistor)
-#define DIGIT_UNITS   2   // D4 — GPIO2  (units digit transistor)
+const uint8_t DIGIT_TENS  = 22;
+const uint8_t DIGIT_UNITS = 23;
 
-#define BTN_INC       5   // D1 — GPIO5  (INPUT_PULLUP)
-#define BTN_DEC       4   // D2 — GPIO4  (INPUT_PULLUP)
-#define BTN_RST      16   // D0 — GPIO16 (INPUT — no internal pull-up, needs 10kΩ external)
+// ── Button pins (INPUT_PULLUP — press connects to GND = LOW) ─────────────────
 
-#define BUZZER_PIN   12   // D6 — GPIO12 (PWM capable)
+const uint8_t BTN_INC = 25;
+const uint8_t BTN_DEC = 26;
+const uint8_t BTN_RST = 27;
+
+// ── Buzzer ────────────────────────────────────────────────────────────────────
+
+const uint8_t BUZZER_PIN = 4;
 
 // ── 7-segment encoding ────────────────────────────────────────────────────────
-// 74HC595 Q0=a, Q1=b, Q2=c, Q3=d, Q4=e, Q5=f, Q6=g, Q7=NC
 // Common cathode: bit HIGH = segment ON
+// Bit position: 0=a, 1=b, 2=c, 3=d, 4=e, 5=f, 6=g
 //
-//   _
-//  |_|   a=top, b=top-right, c=bot-right, d=bottom
-//  |_|   e=bot-left, f=top-left, g=middle
+//     a
+//   ┌───┐
+// f │   │ b
+//   ├───┤  ← g
+// e │   │ c
+//   └───┘
+//     d
 
 const uint8_t SEG_MAP[10] = {
   0x3F, // 0: a b c d e f  ·
@@ -75,10 +93,13 @@ int counter = 0;
 
 // ── Buzzer — non-blocking AC-remote two-phase beep ────────────────────────────
 //
-// Phase 0: 3800 Hz, 25 ms — sharp high-pitched attack
-// Phase 1:    0 Hz,  5 ms — brief silence
-// Phase 2: 2800 Hz, 60 ms — warm body tone
-// Matches the "tick-beep" of Daikin/Mitsubishi/Panasonic AC remotes.
+// Matches the "tick-beep" of Daikin / Mitsubishi / Panasonic AC remotes:
+//   Phase 0: 3800 Hz, 25 ms — sharp high-pitched attack (the "tick")
+//   Phase 1:    0 Hz,  5 ms — brief silence gap
+//   Phase 2: 2800 Hz, 60 ms — warm body tone  (the "beep")
+//
+// Uses ESP32 LEDC hardware timer — completely non-blocking so display
+// multiplexing continues uninterrupted during the beep.
 
 struct BeepPhase { uint32_t freq; uint32_t ms; };
 
@@ -95,7 +116,7 @@ uint32_t beepPhaseMs =  0;
 void beepStart() {
   beepPhase   = 0;
   beepPhaseMs = millis();
-  tone(BUZZER_PIN, BEEP_SEQ[0].freq);
+  ledcWriteTone(BUZZER_PIN, BEEP_SEQ[0].freq);
 }
 
 void beepTick() {
@@ -104,15 +125,12 @@ void beepTick() {
 
   beepPhase++;
   if (beepPhase >= BEEP_PHASES) {
-    noTone(BUZZER_PIN);
+    ledcWriteTone(BUZZER_PIN, 0);
     beepPhase = -1;
     return;
   }
   beepPhaseMs = millis();
-  if (BEEP_SEQ[beepPhase].freq > 0)
-    tone(BUZZER_PIN, BEEP_SEQ[beepPhase].freq);
-  else
-    noTone(BUZZER_PIN);
+  ledcWriteTone(BUZZER_PIN, BEEP_SEQ[beepPhase].freq);
 }
 
 // ── Button debounce ───────────────────────────────────────────────────────────
@@ -142,16 +160,21 @@ bool checkPress(Button &btn) {
   return false;
 }
 
-// ── Display multiplexing via 74HC595 ─────────────────────────────────────────
+// ── Display multiplexing ──────────────────────────────────────────────────────
 
-const uint32_t MUX_US = 2000;   // 2 ms per digit → 250 Hz, no flicker
+const uint32_t MUX_US = 2000;   // 2 ms per digit → 250 Hz refresh, no flicker
 uint32_t lastMuxUs = 0;
 bool     showTens  = true;
 
-void shift595(uint8_t data) {
-  digitalWrite(PIN_LATCH, LOW);
-  SPI.transfer(data);
-  digitalWrite(PIN_LATCH, HIGH);
+void writeSegments(uint8_t digit) {
+  uint8_t enc = SEG_MAP[digit];
+  for (int i = 0; i < 7; i++) {
+    digitalWrite(SEG_PINS[i], (enc >> i) & 1);
+  }
+}
+
+void clearSegments() {
+  for (int i = 0; i < 7; i++) digitalWrite(SEG_PINS[i], LOW);
 }
 
 // Call every loop iteration — switches active digit every MUX_US microseconds.
@@ -159,16 +182,16 @@ void updateDisplay() {
   if (micros() - lastMuxUs < MUX_US) return;
   lastMuxUs = micros();
 
-  // Blank both digits first to prevent ghosting on transistor switch.
+  // Blank both digits before switching to prevent ghosting.
   digitalWrite(DIGIT_TENS,  LOW);
   digitalWrite(DIGIT_UNITS, LOW);
-  shift595(0x00);
+  clearSegments();
 
   if (showTens) {
-    shift595(SEG_MAP[counter / 10]);
+    writeSegments(counter / 10);
     digitalWrite(DIGIT_TENS, HIGH);
   } else {
-    shift595(SEG_MAP[counter % 10]);
+    writeSegments(counter % 10);
     digitalWrite(DIGIT_UNITS, HIGH);
   }
   showTens = !showTens;
@@ -177,23 +200,21 @@ void updateDisplay() {
 // ── Setup & Loop ──────────────────────────────────────────────────────────────
 
 void setup() {
-  // Hardware SPI: MOSI=D7(GPIO13), CLK=D5(GPIO14) assigned automatically
-  SPI.begin();
-  SPI.setFrequency(1000000);     // 1 MHz — well within 74HC595 max spec (25 MHz)
-  SPI.setDataMode(SPI_MODE0);
-
-  pinMode(PIN_LATCH, OUTPUT);
-  shift595(0x00);                // clear 595 at start
+  for (int i = 0; i < 7; i++) {
+    pinMode(SEG_PINS[i], OUTPUT);
+    digitalWrite(SEG_PINS[i], LOW);
+  }
 
   pinMode(DIGIT_TENS,  OUTPUT); digitalWrite(DIGIT_TENS,  LOW);
   pinMode(DIGIT_UNITS, OUTPUT); digitalWrite(DIGIT_UNITS, LOW);
 
-  pinMode(BTN_INC, INPUT_PULLUP);  // GPIO5 — internal pull-up available
-  pinMode(BTN_DEC, INPUT_PULLUP);  // GPIO4 — internal pull-up available
-  pinMode(BTN_RST, INPUT);         // GPIO16 — NO internal pull-up, needs external 10kΩ
+  pinMode(BTN_INC, INPUT_PULLUP);
+  pinMode(BTN_DEC, INPUT_PULLUP);
+  pinMode(BTN_RST, INPUT_PULLUP);
 
-  pinMode(BUZZER_PIN, OUTPUT);
-  noTone(BUZZER_PIN);
+  // Buzzer via ESP32 LEDC hardware PWM (core 3.x API)
+  ledcAttach(BUZZER_PIN, 2800, 8);  // pin, initial freq, 8-bit resolution
+  ledcWrite(BUZZER_PIN, 0);         // silent at start
 }
 
 void loop() {
