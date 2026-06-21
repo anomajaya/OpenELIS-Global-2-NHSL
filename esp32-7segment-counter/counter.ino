@@ -179,11 +179,27 @@ void setup() {
   pinMode(BTN_DEC, INPUT_PULLUP);
   pinMode(BTN_RST, INPUT_PULLUP);
 
+  // Wait for pull-ups to fully settle before first read
+  delay(100);
+
+  // Re-initialize buttons from actual pin state to prevent false boot triggers
+  {
+    bool inc0 = digitalRead(BTN_INC);
+    bool dec0 = digitalRead(BTN_DEC);
+    bool rst0 = digitalRead(BTN_RST);
+    btnInc = {BTN_INC, inc0, inc0, 0};
+    btnDec = {BTN_DEC, dec0, dec0, 0};
+    btnRst = {BTN_RST, rst0, rst0, 0};
+  }
+
   ledcAttach(BUZZER_PIN, 2800, 8);
   ledcWrite(BUZZER_PIN, 0);
 
   Serial.begin(115200);
   Serial.println("Boot OK");
+  Serial.printf("Pin states: INC=%d DEC=%d RST=%d\n",
+                digitalRead(BTN_INC), digitalRead(BTN_DEC), digitalRead(BTN_RST));
+  Serial.println("(1=idle  0=stuck-low or pressed)");
 }
 
 void loop() {
@@ -193,4 +209,12 @@ void loop() {
   if (checkPress(btnInc)) { if (counter < COUNT_MAX) counter++; beepStart(); Serial.printf("INC → %d\n", counter); }
   if (checkPress(btnDec)) { if (counter > COUNT_MIN) counter--; beepStart(); Serial.printf("DEC → %d\n", counter); }
   if (checkPress(btnRst)) { counter = COUNT_MIN; beepStart(); Serial.println("RST → 0"); }
+
+  // Print raw pin readings every 2 s — press each button and watch these values
+  static uint32_t lastDiagMs = 0;
+  if (millis() - lastDiagMs >= 2000) {
+    lastDiagMs = millis();
+    Serial.printf("RAW INC=%d DEC=%d RST=%d  cnt=%d\n",
+                  digitalRead(BTN_INC), digitalRead(BTN_DEC), digitalRead(BTN_RST), counter);
+  }
 }
