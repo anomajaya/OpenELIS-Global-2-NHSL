@@ -1,21 +1,27 @@
 /*
  * 2-Digit 7-Segment LED Counter (0–30)
  * ESP32-WROOM-32 DevKitC (38-pin)
- * Display: MLN5241RK (2-digit, common cathode, red)
+ * Display: 5261AS (2-digit, COMMON ANODE, red)
  *
- * Wiring:
- *   GPIO 13 → 150Ω → Seg a  ┐
- *   GPIO 14 → 150Ω → Seg b  │
- *   GPIO 16 → 150Ω → Seg c  │ both digits share these segment lines
- *   GPIO 17 → 150Ω → Seg d  │
- *   GPIO 18 → 150Ω → Seg e  │
- *   GPIO 19 → 150Ω → Seg f  │
- *   GPIO 21 → 150Ω → Seg g  ┘
- *   GPIO 22 → 1kΩ → BC547 Q1 base; Q1 collector → COM1 pin 15 (TENS  digit)
- *   GPIO 23 → 1kΩ → BC547 Q2 base; Q2 collector → COM2 pin 6  (UNITS digit)
- *   GPIO 25 → BTN_INC → GND  (INPUT_PULLUP)
- *   GPIO 32 → BTN_DEC → GND  (INPUT_PULLUP)
- *   GPIO 33 → BTN_RST → GND  (INPUT_PULLUP)
+ * Segment wiring (cathode side — LOW = ON):
+ *   GPIO 13 → 150Ω → Pin 8  (Seg a)  ┐
+ *   GPIO 14 → 150Ω → Pin 7  (Seg b)  │
+ *   GPIO 16 → 150Ω → Pin 4  (Seg c)  │ both digits share these lines
+ *   GPIO 17 → 150Ω → Pin 2  (Seg d)  │
+ *   GPIO 18 → 150Ω → Pin 1  (Seg e)  │
+ *   GPIO 19 → 150Ω → Pin 9  (Seg f)  │
+ *   GPIO 21 → 150Ω → Pin 10 (Seg g)  ┘
+ *   Pin 5 (DP) — leave unconnected
+ *
+ * Digit select — BC557 PNP (LOW = digit ON):
+ *   GPIO 22 → 1kΩ → BC557 Q1 base; Q1 emitter → 3.3V; Q1 collector → Pin 3 COM1 (TENS)
+ *   GPIO 23 → 1kΩ → BC557 Q2 base; Q2 emitter → 3.3V; Q2 collector → Pin 6 COM2 (UNITS)
+ *
+ * Buttons (INPUT_PULLUP — press connects to GND):
+ *   GPIO 25 → BTN_INC → GND
+ *   GPIO 32 → BTN_DEC → GND
+ *   GPIO 33 → BTN_RST → GND
+ *
  *   GPIO 4  → 150Ω → Passive Buzzer (+) → GND
  */
 
@@ -48,7 +54,7 @@ const uint8_t BTN_RST      = 33;
 const uint8_t BUZZER_PIN   = 4;
 
 // ── 7-segment encoding ────────────────────────────────────────────────────────
-// Common cathode: bit HIGH = segment ON
+// Common anode: bit 1 = segment ON (GPIO driven LOW), bit 0 = segment OFF (GPIO HIGH)
 // Bit position: 0=a, 1=b, 2=c, 3=d, 4=e, 5=f, 6=g
 //
 //     a
@@ -138,28 +144,31 @@ bool     showTens  = true;
 void writeSegments(uint8_t digit) {
   uint8_t enc = SEG_MAP[digit];
   for (int i = 0; i < 7; i++) {
-    digitalWrite(SEG_PINS[i], (enc >> i) & 1);
+    // Common anode: segment ON = GPIO LOW (inverted)
+    digitalWrite(SEG_PINS[i], ((enc >> i) & 1) ? LOW : HIGH);
   }
 }
 
 void clearSegments() {
-  for (int i = 0; i < 7; i++) digitalWrite(SEG_PINS[i], LOW);
+  // Common anode: HIGH = segment OFF
+  for (int i = 0; i < 7; i++) digitalWrite(SEG_PINS[i], HIGH);
 }
 
 void updateDisplay() {
   if (micros() - lastMuxUs < MUX_US) return;
   lastMuxUs = micros();
 
-  digitalWrite(DIGIT_TENS,  LOW);
-  digitalWrite(DIGIT_UNITS, LOW);
+  // PNP: HIGH = digit OFF (deselect both first)
+  digitalWrite(DIGIT_TENS,  HIGH);
+  digitalWrite(DIGIT_UNITS, HIGH);
   clearSegments();
 
   if (showTens) {
     writeSegments(counter / 10);
-    digitalWrite(DIGIT_TENS, HIGH);
+    digitalWrite(DIGIT_TENS, LOW);   // PNP: LOW = digit ON
   } else {
     writeSegments(counter % 10);
-    digitalWrite(DIGIT_UNITS, HIGH);
+    digitalWrite(DIGIT_UNITS, LOW);  // PNP: LOW = digit ON
   }
   showTens = !showTens;
 }
@@ -169,11 +178,12 @@ void updateDisplay() {
 void setup() {
   for (int i = 0; i < 7; i++) {
     pinMode(SEG_PINS[i], OUTPUT);
-    digitalWrite(SEG_PINS[i], LOW);
+    digitalWrite(SEG_PINS[i], HIGH);  // Common anode: HIGH = segment OFF at boot
   }
 
-  pinMode(DIGIT_TENS,  OUTPUT); digitalWrite(DIGIT_TENS,  LOW);
-  pinMode(DIGIT_UNITS, OUTPUT); digitalWrite(DIGIT_UNITS, LOW);
+  // PNP digit drivers: HIGH = digit OFF at boot
+  pinMode(DIGIT_TENS,  OUTPUT); digitalWrite(DIGIT_TENS,  HIGH);
+  pinMode(DIGIT_UNITS, OUTPUT); digitalWrite(DIGIT_UNITS, HIGH);
 
   pinMode(BTN_INC, INPUT_PULLUP);
   pinMode(BTN_DEC, INPUT_PULLUP);
@@ -202,19 +212,19 @@ void setup() {
   Serial.println("(1=idle  0=stuck-low or pressed)");
 
   // ── Segment scan: light each GPIO one at a time for 800 ms ──────────────
-  // Enable both digit drivers so you can see which physical segment lights up
-  digitalWrite(DIGIT_TENS,  HIGH);
-  digitalWrite(DIGIT_UNITS, HIGH);
+  // PNP: LOW = digit ON — enable both digits for the scan
+  digitalWrite(DIGIT_TENS,  LOW);
+  digitalWrite(DIGIT_UNITS, LOW);
   const char* segNames[7] = {"a(top)","b(upper-R)","c(lower-R)","d(bottom)","e(lower-L)","f(upper-L)","g(middle)"};
   for (int i = 0; i < 7; i++) {
     Serial.printf("SEG %s  GPIO %d\n", segNames[i], SEG_PINS[i]);
-    digitalWrite(SEG_PINS[i], HIGH);
+    digitalWrite(SEG_PINS[i], LOW);   // Common anode: LOW = segment ON
     delay(800);
-    digitalWrite(SEG_PINS[i], LOW);
+    digitalWrite(SEG_PINS[i], HIGH);  // OFF
     delay(200);
   }
-  digitalWrite(DIGIT_TENS,  LOW);
-  digitalWrite(DIGIT_UNITS, LOW);
+  digitalWrite(DIGIT_TENS,  HIGH);   // PNP: HIGH = digit OFF
+  digitalWrite(DIGIT_UNITS, HIGH);
   Serial.println("Scan done — counter starting");
 }
 
