@@ -4,16 +4,16 @@
  * Display: 2-digit COMMON CATHODE, red (10-pin, 5 per side)
  *
  * Display pinout (pin 1 = bottom-left, face toward you):
- *   Pin 1  (a)    → 150Ω → GPIO 13
- *   Pin 2  (f)    → 150Ω → GPIO 19
- *   Pin 3  (e)    → 150Ω → GPIO 18   ← confirmed by hand test
+ *   Pin 1  (c)    → 150Ω → GPIO 16
+ *   Pin 2  (DP)   — leave unconnected
+ *   Pin 3  (e)    → 150Ω → GPIO 18
  *   Pin 4  (d)    → 150Ω → GPIO 17
  *   Pin 5  (g)    → 150Ω → GPIO 21
- *   Pin 6  (c)    → 150Ω → GPIO 16
- *   Pin 7  (DIG2) → BC547 Q2 collector  (UNITS digit) ← confirmed
- *   Pin 8  (DIG1) → BC547 Q1 collector  (TENS  digit) ← confirmed
+ *   Pin 6  (f)    → 150Ω → GPIO 19
+ *   Pin 7  (DIG2) → BC547 Q2 collector  (UNITS digit)
+ *   Pin 8  (DIG1) → BC547 Q1 collector  (TENS  digit)
  *   Pin 9  (b)    → 150Ω → GPIO 14
- *   Pin 10 (DP)   — leave unconnected
+ *   Pin 10 (a)    → 150Ω → GPIO 13
  *
  * Digit select — BC547 NPN (HIGH = digit ON):
  *   GPIO 22 → 1kΩ → Q1 base; Q1 collector → Pin 8 DIG1; Q1 emitter → GND
