@@ -1,5 +1,5 @@
 /*
- * 2-Digit 7-Segment LED Counter (0–30 manual / 00–99 via IR remote)
+ * 2-Digit 7-Segment LED Counter (00–99, buttons + IR remote)
  * ESP32-WROOM-32 DevKitC (38-pin)
  * Display: 2-digit COMMON CATHODE, red (10-pin, 5 per side)
  *
@@ -125,9 +125,8 @@ const uint8_t SEG_MAP[10] = {
 
 // ── Counter ───────────────────────────────────────────────────────────────────
 
-const int COUNT_MAX = 30;   // manual INC button limit (as originally planned)
+const int COUNT_MAX = 99;   // full 2-digit range for both buttons and IR remote
 const int COUNT_MIN =  0;
-const int IR_MAX    = 99;   // IR remote works over the full 2-digit range
 int counter = 0;
 
 // ── Buzzer — non-blocking AC-remote two-phase beep ────────────────────────────
@@ -216,7 +215,7 @@ void handleIR() {
 
   if (cmd == IR_CMD_UP) {
     pendingTens = -1;                 // arrow cancels a half-entered number
-    if (counter < IR_MAX) counter++;
+    if (counter < COUNT_MAX) counter++;
     beepStart();
     Serial.printf("IR UP → %02d\n", counter);
     return;
