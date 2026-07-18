@@ -1,7 +1,10 @@
 /*
- * 2-Digit 7-Segment LED Counter (0–30)
+ * 2-Digit 7-Segment LED Counter (0–30 manual / 00–99 via IR remote)
  * ESP32-WROOM-32 DevKitC (38-pin)
  * Display: 2-digit COMMON CATHODE, red (10-pin, 5 per side)
+ *
+ * Requires library: "IRremote" by Armin Joachimsmeyer, version 4.x
+ * (Arduino IDE → Tools → Manage Libraries → search "IRremote")
  *
  * Display pinout (pin 1 = bottom-left, face toward you):
  *   Pin 1  (c)    → 150Ω → GPIO 16
@@ -24,8 +27,24 @@
  *   GPIO 32 → BTN_DEC → GND
  *   GPIO 33 → BTN_RST → GND
  *
+ * Buzzer:
  *   GPIO 4  → 150Ω → Passive Buzzer (+) → GND
+ *
+ * IR receiver — 1838 / VS1838B 38 kHz module:
+ *   OUT/S  → GPIO 35   (input-only pin, ideal for this)
+ *   VCC/+  → 3.3V
+ *   GND/-  → GND rail
+ *
+ * IR remote behaviour:
+ *   - Press two digit keys (e.g. 1 then 8) → display shows 18.
+ *   - A single digit followed by 4 s of silence → shown as 0X.
+ *   - After a number is shown, digit keys are IGNORED for 4 seconds.
+ *   - UP arrow   → +1 (max 99).   DOWN arrow → −1 (min 0).
+ *   - Manual buttons keep working exactly as before.
  */
+
+#define DECODE_NEC          // restrict IRremote to NEC — saves RAM, faster
+#include <IRremote.hpp>
 
 // ── Structs first — Arduino IDE auto-generates prototypes before any code,
 //    so structs used in function signatures must be declared at the top. ───────
@@ -54,6 +73,30 @@ const uint8_t BTN_DEC      = 32;
 const uint8_t BTN_RST      = 33;
 
 const uint8_t BUZZER_PIN   = 4;
+const uint8_t IR_RECV_PIN  = 35;
+
+// ── IR remote key codes (NEC command byte) ────────────────────────────────────
+// Default map = the common 17-key kit remote (HX1838 kits, address 0x00).
+// If your remote differs, press its keys and watch the Serial Monitor —
+// unknown codes are printed as  "IR unknown cmd=0x??"  → edit the values here.
+
+const uint8_t IR_CMD_DIGIT[10] = {
+  0x19, // 0
+  0x45, // 1
+  0x46, // 2
+  0x47, // 3
+  0x44, // 4
+  0x40, // 5
+  0x43, // 6
+  0x07, // 7
+  0x15, // 8
+  0x09, // 9
+};
+const uint8_t IR_CMD_UP   = 0x18;   // ▲ arrow
+const uint8_t IR_CMD_DOWN = 0x52;   // ▼ arrow
+
+const uint32_t IR_LOCKOUT_MS = 4000;  // digit keys ignored this long after a number is set
+const uint32_t IR_ENTRY_MS   = 4000;  // max wait for the second digit
 
 // ── 7-segment encoding ────────────────────────────────────────────────────────
 // Common cathode: bit 1 = segment ON (GPIO HIGH), bit 0 = segment OFF (GPIO LOW)
@@ -82,8 +125,9 @@ const uint8_t SEG_MAP[10] = {
 
 // ── Counter ───────────────────────────────────────────────────────────────────
 
-const int COUNT_MAX = 30;
+const int COUNT_MAX = 30;   // manual INC button limit (as originally planned)
 const int COUNT_MIN =  0;
+const int IR_MAX    = 99;   // IR remote works over the full 2-digit range
 int counter = 0;
 
 // ── Buzzer — non-blocking AC-remote two-phase beep ────────────────────────────
@@ -135,6 +179,79 @@ bool checkPress(Button &btn) {
     return r == LOW;
   }
   return false;
+}
+
+// ── IR remote handling ────────────────────────────────────────────────────────
+
+int      pendingTens   = -1;  // first digit of a 2-key entry, -1 = none
+uint32_t pendingMs     =  0;  // when the first digit arrived
+uint32_t lockoutUntilMs = 0;  // digit keys ignored until this time
+
+int digitFromCmd(uint8_t cmd) {
+  for (int d = 0; d < 10; d++) {
+    if (IR_CMD_DIGIT[d] == cmd) return d;
+  }
+  return -1;
+}
+
+void handleIR() {
+  uint32_t now = millis();
+
+  // First digit entered but second never arrived → apply it as 0X
+  if (pendingTens >= 0 && now - pendingMs >= IR_ENTRY_MS) {
+    counter = pendingTens;
+    pendingTens = -1;
+    lockoutUntilMs = now + IR_LOCKOUT_MS;
+    beepStart();
+    Serial.printf("IR single digit → %02d\n", counter);
+  }
+
+  if (!IrReceiver.decode()) return;
+  uint8_t cmd     = IrReceiver.decodedIRData.command;
+  bool    repeat  = IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT;
+  IrReceiver.resume();
+  if (repeat) return;                 // ignore NEC held-key repeat frames
+
+  now = millis();
+
+  if (cmd == IR_CMD_UP) {
+    pendingTens = -1;                 // arrow cancels a half-entered number
+    if (counter < IR_MAX) counter++;
+    beepStart();
+    Serial.printf("IR UP → %02d\n", counter);
+    return;
+  }
+
+  if (cmd == IR_CMD_DOWN) {
+    pendingTens = -1;
+    if (counter > COUNT_MIN) counter--;
+    beepStart();
+    Serial.printf("IR DOWN → %02d\n", counter);
+    return;
+  }
+
+  int d = digitFromCmd(cmd);
+  if (d < 0) {
+    Serial.printf("IR unknown cmd=0x%02X\n", cmd);   // use this to remap keys
+    return;
+  }
+
+  if ((int32_t)(now - lockoutUntilMs) < 0) {
+    Serial.printf("IR digit %d ignored (4 s lockout)\n", d);
+    return;
+  }
+
+  if (pendingTens < 0) {
+    pendingTens = d;                  // first key = tens digit, wait for second
+    pendingMs   = now;
+    Serial.printf("IR first digit %d — waiting for second...\n", d);
+  } else {
+    counter = pendingTens * 10 + d;   // second key completes the number
+    pendingTens = -1;
+    lockoutUntilMs = now + IR_LOCKOUT_MS;
+    beepStart();
+    Serial.printf("IR entry → %02d\n", counter);
+  }
 }
 
 // ── Display multiplexing ──────────────────────────────────────────────────────
@@ -209,6 +326,9 @@ void setup() {
                 digitalRead(BTN_INC), digitalRead(BTN_DEC), digitalRead(BTN_RST));
   Serial.println("(1=idle  0=stuck-low or pressed)");
 
+  IrReceiver.begin(IR_RECV_PIN, DISABLE_LED_FEEDBACK);
+  Serial.printf("IR receiver listening on GPIO %d\n", IR_RECV_PIN);
+
   // ── Segment scan: light each GPIO one at a time for 800 ms ──────────────
   // Enable both digit drivers so you can see which physical segment lights up
   digitalWrite(DIGIT_TENS,  HIGH);
@@ -229,6 +349,7 @@ void setup() {
 void loop() {
   updateDisplay();
   beepTick();
+  handleIR();
 
   if (checkPress(btnInc)) { if (counter < COUNT_MAX) counter++; beepStart(); Serial.printf("INC → %d\n", counter); }
   if (checkPress(btnDec)) { if (counter > COUNT_MIN) counter--; beepStart(); Serial.printf("DEC → %d\n", counter); }
