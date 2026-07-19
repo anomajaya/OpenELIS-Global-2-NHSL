@@ -1,5 +1,5 @@
 /*
- * 2-Digit 7-Segment LED Counter (00–99, buttons + IR remote)
+ * 2-Digit 7-Segment Counter + 5V Fan Speed Controller (00–99, "FF" = 100)
  * ESP32-WROOM-32 DevKitC (38-pin)
  * Display: 2-digit COMMON CATHODE, red (10-pin, 5 per side)
  *
@@ -35,12 +35,22 @@
  *   VCC/+  → 3.3V
  *   GND/-  → GND rail
  *
- * IR remote behaviour:
- *   - Press two digit keys (e.g. 1 then 8) → display shows 18.
- *   - A single digit followed by 4 s of silence → shown as 0X.
- *   - After a number is shown, digit keys are IGNORED for 4 seconds.
- *   - UP arrow   → +1 (max 99).   DOWN arrow → −1 (min 0).
- *   - Manual buttons keep working exactly as before.
+ * Fan — 5V DC, PWM speed control (Q3 = 2N2222 / S8050 NPN):
+ *   VIN (5V)  → Fan (+)
+ *   Fan (−)   → Q3 collector;  Q3 emitter → GND
+ *   GPIO 2    → 1kΩ → Q3 base
+ *   1N4007 flyback diode ACROSS the fan: stripe (cathode) to VIN, other leg to Fan (−)
+ *   (GPIO 2 is LOW at boot → fan stays off during startup. Onboard LED
+ *    shares GPIO 2, so its brightness mirrors fan speed — free indicator!)
+ *
+ * Behaviour:
+ *   - Value 0   → fan off.   Value 100 → full speed (display shows "FF").
+ *   - Fan speed is proportional to the displayed value (PWM).
+ *   - IR digits: two keys form 00–99 (single key + 4 s = 0X), then 4 s lockout.
+ *   - IR ▲/▼: +1 / −1 (0–99).
+ *   - IR * : set to 00 (fan off).
+ *   - IR # : step up 10 → 20 → ... → 100 (next multiple of 10, max 100).
+ *   - Physical buttons: INC +1 (max 99), DEC −1 (min 0), RST → 00.
  */
 
 #define DECODE_NEC          // restrict IRremote to NEC — saves RAM, faster
@@ -74,6 +84,7 @@ const uint8_t BTN_RST      = 33;
 
 const uint8_t BUZZER_PIN   = 4;
 const uint8_t IR_RECV_PIN  = 35;
+const uint8_t FAN_PIN      = 2;    // PWM → 1kΩ → Q3 base (LOW at boot = fan off)
 
 // ── IR remote key codes (NEC command byte) ────────────────────────────────────
 // Default map = the common 17-key kit remote (HX1838 kits, address 0x00).
@@ -94,6 +105,8 @@ const uint8_t IR_CMD_DIGIT[10] = {
 };
 const uint8_t IR_CMD_UP   = 0x18;   // ▲ arrow
 const uint8_t IR_CMD_DOWN = 0x52;   // ▼ arrow
+const uint8_t IR_CMD_STAR = 0x16;   // *  → fan off (00)
+const uint8_t IR_CMD_HASH = 0x0D;   // #  → next multiple of 10, up to 100
 
 const uint32_t IR_LOCKOUT_MS = 4000;  // digit keys ignored this long after a number is set
 const uint32_t IR_ENTRY_MS   = 4000;  // max wait for the second digit
@@ -123,11 +136,14 @@ const uint8_t SEG_MAP[10] = {
   0x6F, // 9: a b c d · f  g
 };
 
-// ── Counter ───────────────────────────────────────────────────────────────────
+const uint8_t SEG_F = 0x71;  // letter F (a, f, g, e) — "FF" means value 100
 
-const int COUNT_MAX = 99;   // full 2-digit range for both buttons and IR remote
+// ── Counter / fan value ───────────────────────────────────────────────────────
+
+const int COUNT_MAX = 99;    // limit for +1/−1 steps (buttons and IR arrows)
 const int COUNT_MIN =  0;
-int counter = 0;
+const int FAN_MAX   = 100;   // reachable only via the # key
+int counter = 0;             // 0–100; doubles as fan speed in percent
 
 // ── Buzzer — non-blocking AC-remote two-phase beep ────────────────────────────
 
@@ -161,6 +177,18 @@ void beepTick() {
   ledcWriteTone(BUZZER_PIN, BEEP_SEQ[beepPhase].freq);
 }
 
+// ── Fan PWM ───────────────────────────────────────────────────────────────────
+// 25 kHz PWM — above audible range, so the fan doesn't whine.
+// Duty maps 0–100 % → 0–255. Small fans may not start below ~30 %.
+
+void applyFan() {
+  static int lastVal = -1;
+  if (counter == lastVal) return;
+  lastVal = counter;
+  uint32_t duty = (uint32_t)counter * 255 / FAN_MAX;
+  ledcWrite(FAN_PIN, duty);
+}
+
 // ── Button debounce ───────────────────────────────────────────────────────────
 
 const uint32_t DEBOUNCE_MS = 50;
@@ -182,9 +210,9 @@ bool checkPress(Button &btn) {
 
 // ── IR remote handling ────────────────────────────────────────────────────────
 
-int      pendingTens   = -1;  // first digit of a 2-key entry, -1 = none
-uint32_t pendingMs     =  0;  // when the first digit arrived
-uint32_t lockoutUntilMs = 0;  // digit keys ignored until this time
+int      pendingTens    = -1;  // first digit of a 2-key entry, -1 = none
+uint32_t pendingMs      =  0;  // when the first digit arrived
+uint32_t lockoutUntilMs =  0;  // digit keys ignored until this time
 
 int digitFromCmd(uint8_t cmd) {
   for (int d = 0; d < 10; d++) {
@@ -214,7 +242,7 @@ void handleIR() {
   now = millis();
 
   if (cmd == IR_CMD_UP) {
-    pendingTens = -1;                 // arrow cancels a half-entered number
+    pendingTens = -1;                 // any command key cancels a half-entered number
     if (counter < COUNT_MAX) counter++;
     beepStart();
     Serial.printf("IR UP → %02d\n", counter);
@@ -226,6 +254,23 @@ void handleIR() {
     if (counter > COUNT_MIN) counter--;
     beepStart();
     Serial.printf("IR DOWN → %02d\n", counter);
+    return;
+  }
+
+  if (cmd == IR_CMD_STAR) {           // * = fan off
+    pendingTens = -1;
+    counter = 0;
+    beepStart();
+    Serial.println("IR * → 00 (fan off)");
+    return;
+  }
+
+  if (cmd == IR_CMD_HASH) {           // # = next multiple of 10, max 100
+    pendingTens = -1;
+    counter = min(FAN_MAX, (counter / 10 + 1) * 10);
+    beepStart();
+    if (counter >= FAN_MAX) Serial.println("IR # → FF (full speed)");
+    else                    Serial.printf("IR # → %02d\n", counter);
     return;
   }
 
@@ -259,8 +304,7 @@ const uint32_t MUX_US = 2000;   // 2 ms per digit → 250 Hz refresh, no flicker
 uint32_t lastMuxUs = 0;
 bool     showTens  = true;
 
-void writeSegments(uint8_t digit) {
-  uint8_t enc = SEG_MAP[digit];
+void writePattern(uint8_t enc) {
   for (int i = 0; i < 7; i++) {
     digitalWrite(SEG_PINS[i], (enc >> i) & 1);
   }
@@ -278,11 +322,20 @@ void updateDisplay() {
   digitalWrite(DIGIT_UNITS, LOW);
   clearSegments();
 
+  uint8_t encTens, encUnits;
+  if (counter >= 100) {                // "FF" = full speed
+    encTens  = SEG_F;
+    encUnits = SEG_F;
+  } else {
+    encTens  = SEG_MAP[counter / 10];
+    encUnits = SEG_MAP[counter % 10];
+  }
+
   if (showTens) {
-    writeSegments(counter / 10);
+    writePattern(encTens);
     digitalWrite(DIGIT_TENS, HIGH);
   } else {
-    writeSegments(counter % 10);
+    writePattern(encUnits);
     digitalWrite(DIGIT_UNITS, HIGH);
   }
   showTens = !showTens;
@@ -302,6 +355,10 @@ void setup() {
   pinMode(BTN_INC, INPUT_PULLUP);
   pinMode(BTN_DEC, INPUT_PULLUP);
   pinMode(BTN_RST, INPUT_PULLUP);
+
+  // Fan PWM: 25 kHz, 8-bit — start with fan off
+  ledcAttach(FAN_PIN, 25000, 8);
+  ledcWrite(FAN_PIN, 0);
 
   // Wait for pull-ups to fully settle before first read
   delay(100);
@@ -327,6 +384,7 @@ void setup() {
 
   IrReceiver.begin(IR_RECV_PIN, DISABLE_LED_FEEDBACK);
   Serial.printf("IR receiver listening on GPIO %d\n", IR_RECV_PIN);
+  Serial.printf("Fan PWM on GPIO %d (25 kHz)\n", FAN_PIN);
 
   // ── Segment scan: light each GPIO one at a time for 800 ms ──────────────
   // Enable both digit drivers so you can see which physical segment lights up
@@ -349,6 +407,7 @@ void loop() {
   updateDisplay();
   beepTick();
   handleIR();
+  applyFan();
 
   if (checkPress(btnInc)) { if (counter < COUNT_MAX) counter++; beepStart(); Serial.printf("INC → %d\n", counter); }
   if (checkPress(btnDec)) { if (counter > COUNT_MIN) counter--; beepStart(); Serial.printf("DEC → %d\n", counter); }
