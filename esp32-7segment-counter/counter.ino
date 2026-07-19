@@ -7,15 +7,15 @@
  * (Arduino IDE → Tools → Manage Libraries → search "IRremote")
  *
  * Display pinout (pin 1 = bottom-left, face toward you):
- *   Pin 1  (c)    → 150Ω → GPIO 16
+ *   Pin 1  (c)    → 150Ω → GPIO 21
  *   Pin 2  (DP)   — leave unconnected
  *   Pin 3  (e)    → 150Ω → GPIO 18
  *   Pin 4  (d)    → 150Ω → GPIO 17
- *   Pin 5  (g)    → 150Ω → GPIO 21
- *   Pin 6  (f)    → 150Ω → GPIO 19
+ *   Pin 5  (g)    → 150Ω → GPIO 16
+ *   Pin 6  (f)    → 150Ω → GPIO 14
  *   Pin 7  (DIG2) → BC547 Q2 collector  (UNITS digit)
  *   Pin 8  (DIG1) → BC547 Q1 collector  (TENS  digit)
- *   Pin 9  (b)    → 150Ω → GPIO 14
+ *   Pin 9  (b)    → 150Ω → GPIO 19
  *   Pin 10 (a)    → 150Ω → GPIO 13
  *
  * Digit select — BC547 NPN (HIGH = digit ON):
@@ -73,7 +73,7 @@ struct Button {
 
 // ── Pin definitions ───────────────────────────────────────────────────────────
 
-const uint8_t SEG_PINS[7]  = {13, 14, 16, 17, 18, 19, 21}; // a, b, c, d, e, f, g
+const uint8_t SEG_PINS[7]  = {13, 19, 21, 17, 18, 14, 16}; // a, b, c, d, e, f, g
 
 const uint8_t DIGIT_TENS   = 22;
 const uint8_t DIGIT_UNITS  = 23;
