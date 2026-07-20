@@ -1,10 +1,18 @@
 /*
- * 2-Digit 7-Segment Counter + 5V Fan Speed Controller (00–99, "FF" = 100)
+ * 2-Digit 7-Segment Counter + 5V Fan Speed Controller + OTA updates
  * ESP32-WROOM-32 DevKitC (38-pin)
  * Display: 2-digit COMMON CATHODE, red (10-pin, 5 per side)
  *
  * Requires library: "IRremote" by Armin Joachimsmeyer, version 4.x
- * (Arduino IDE → Tools → Manage Libraries → search "IRremote")
+ * (WiFi / ArduinoOTA / ESPmDNS ship with the ESP32 board package — no install)
+ *
+ * ── OTA updates ──────────────────────────────────────────────────────────────
+ *   1. Fill in WIFI_SSID / WIFI_PASS below (and change OTA_PASSWORD).
+ *   2. Flash once over USB.
+ *   3. From then on: Arduino IDE → Tools → Port → pick the network port
+ *      "fan-controller at 192.168.x.x" and upload wirelessly.
+ *   The device works fine with no WiFi — it retries every 30 s in the
+ *   background and everything else runs normally.
  *
  * Display pinout (pin 1 = bottom-left, face toward you):
  *   Pin 1  (c)    → 150Ω → GPIO 21
@@ -40,8 +48,6 @@
  *   Fan (−)   → Q3 collector;  Q3 emitter → GND
  *   GPIO 2    → 1kΩ → Q3 base
  *   1N4007 flyback diode ACROSS the fan: stripe (cathode) to VIN, other leg to Fan (−)
- *   (GPIO 2 is LOW at boot → fan stays off during startup. Onboard LED
- *    shares GPIO 2, so its brightness mirrors fan speed — free indicator!)
  *
  * Behaviour:
  *   - Value 0   → fan off.   Value 100 → full speed (display shows "FF").
@@ -58,6 +64,19 @@
 
 #define DECODE_NEC          // restrict IRremote to NEC — saves RAM, faster
 #include <IRremote.hpp>
+#include <WiFi.h>
+#include <ESPmDNS.h>
+#include <WiFiUdp.h>
+#include <ArduinoOTA.h>
+
+// ── WiFi / OTA settings — EDIT THESE ─────────────────────────────────────────
+
+const char* WIFI_SSID    = "YOUR_WIFI_NAME";      // ← your WiFi network name
+const char* WIFI_PASS    = "YOUR_WIFI_PASSWORD";  // ← your WiFi password
+const char* OTA_HOSTNAME = "fan-controller";      // name shown in the IDE port list
+const char* OTA_PASSWORD = "fan1234";             // ← change this! asked on upload
+
+const uint32_t WIFI_RETRY_MS = 30000;  // retry WiFi every 30 s if not connected
 
 // ── Structs first — Arduino IDE auto-generates prototypes before any code,
 //    so structs used in function signatures must be declared at the top. ───────
@@ -108,7 +127,7 @@ const uint8_t IR_CMD_DIGIT[10] = {
 };
 const uint8_t IR_CMD_UP   = 0x18;   // ▲ arrow
 const uint8_t IR_CMD_DOWN = 0x52;   // ▼ arrow
-const uint8_t IR_CMD_STAR = 0x16;   // *  → fan off (00)
+const uint8_t IR_CMD_STAR = 0x16;   // *  → fan off (0)
 const uint8_t IR_CMD_HASH = 0x0D;   // #  → next multiple of 10, up to 100
 
 const uint32_t IR_SHIFT_MS = 3000;  // a digit within this window shifts the previous one left
@@ -189,6 +208,60 @@ void applyFan() {
   lastVal = counter;
   uint32_t duty = (uint32_t)counter * 255 / FAN_MAX;
   ledcWrite(FAN_PIN, duty);
+}
+
+// ── WiFi + OTA (non-blocking) ─────────────────────────────────────────────────
+// The controller never waits for WiFi: it starts an attempt, keeps running,
+// and finishes OTA setup whenever the connection succeeds.
+
+bool     otaReady        = false;
+uint32_t lastWifiTryMs   = 0;
+
+void otaSetup() {
+  ArduinoOTA.setHostname(OTA_HOSTNAME);
+  ArduinoOTA.setPassword(OTA_PASSWORD);
+
+  ArduinoOTA.onStart([]() {
+    // Quiesce the hardware during the flash write
+    digitalWrite(DIGIT_TENS,  LOW);
+    digitalWrite(DIGIT_UNITS, LOW);
+    ledcWriteTone(BUZZER_PIN, 0);
+    ledcWrite(FAN_PIN, 0);
+    Serial.println("OTA: update starting");
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nOTA: done, rebooting");
+  });
+  ArduinoOTA.onProgress([](unsigned int prog, unsigned int total) {
+    static int lastPct = -1;
+    int pct = (int)(prog * 100UL / total);
+    if (pct / 10 != lastPct / 10) { Serial.printf("OTA: %d%%\n", pct); lastPct = pct; }
+  });
+  ArduinoOTA.onError([](ota_error_t err) {
+    Serial.printf("OTA error %u — device keeps old firmware\n", err);
+  });
+
+  ArduinoOTA.begin();
+  otaReady = true;
+  Serial.printf("OTA ready — hostname '%s', IP %s\n",
+                OTA_HOSTNAME, WiFi.localIP().toString().c_str());
+}
+
+void wifiTick() {
+  if (otaReady) {
+    ArduinoOTA.handle();
+    return;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    otaSetup();
+    return;
+  }
+  if (millis() - lastWifiTryMs >= WIFI_RETRY_MS) {
+    lastWifiTryMs = millis();
+    Serial.printf("WiFi: connecting to '%s'...\n", WIFI_SSID);
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+  }
 }
 
 // ── Button debounce ───────────────────────────────────────────────────────────
@@ -367,6 +440,13 @@ void setup() {
                 digitalRead(BTN_INC), digitalRead(BTN_DEC), digitalRead(BTN_RST));
   Serial.println("(1=idle  0=stuck-low or pressed)");
 
+  // Start WiFi in the background — wifiTick() finishes OTA setup once connected
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);              // keeps OTA discovery responsive
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  lastWifiTryMs = millis();
+  Serial.printf("WiFi: connecting to '%s' (non-blocking)...\n", WIFI_SSID);
+
   IrReceiver.begin(IR_RECV_PIN, DISABLE_LED_FEEDBACK);
   Serial.printf("IR receiver listening on GPIO %d\n", IR_RECV_PIN);
   Serial.printf("Fan PWM on GPIO %d (25 kHz)\n", FAN_PIN);
@@ -393,6 +473,7 @@ void loop() {
   beepTick();
   handleIR();
   applyFan();
+  wifiTick();
 
   if (checkPress(btnInc)) { if (counter < COUNT_MAX) counter++; beepStart(); Serial.printf("INC → %d\n", counter); }
   if (checkPress(btnDec)) { if (counter > COUNT_MIN) counter--; beepStart(); Serial.printf("DEC → %d\n", counter); }
