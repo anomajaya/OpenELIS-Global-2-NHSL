@@ -56,7 +56,8 @@
  *   - IR digits: each press shows immediately on the right digit. A second
  *     press within 3 s shifts the right digit to the left (e.g. 1 then 8 = 18).
  *     After a 3 s gap, the next press starts fresh on the right digit.
- *   - IR ▲/▼: +1 / −1 (0–99).
+ *   - IR ▲/► : +1  and  ▼/◄ : −1 (0–99).
+ *   - IR OK : FF (full speed, 100).
  *   - IR * : set to 0 (fan off).
  *   - IR # : step up 10 → 20 → ... → 100 (next multiple of 10, max 100).
  *   - Physical buttons: INC +1 (max 99), DEC −1 (min 0), RST → 0.
@@ -125,10 +126,13 @@ const uint8_t IR_CMD_DIGIT[10] = {
   0x15, // 8
   0x09, // 9
 };
-const uint8_t IR_CMD_UP   = 0x18;   // ▲ arrow
-const uint8_t IR_CMD_DOWN = 0x52;   // ▼ arrow
-const uint8_t IR_CMD_STAR = 0x16;   // *  → fan off (0)
-const uint8_t IR_CMD_HASH = 0x0D;   // #  → next multiple of 10, up to 100
+const uint8_t IR_CMD_UP    = 0x18;  // ▲ arrow → +1
+const uint8_t IR_CMD_DOWN  = 0x52;  // ▼ arrow → −1
+const uint8_t IR_CMD_RIGHT = 0x5A;  // ► arrow → +1
+const uint8_t IR_CMD_LEFT  = 0x08;  // ◄ arrow → −1
+const uint8_t IR_CMD_OK    = 0x1C;  // OK      → FF (full speed, 100)
+const uint8_t IR_CMD_STAR  = 0x16;  // *  → fan off (0)
+const uint8_t IR_CMD_HASH  = 0x0D;  // #  → next multiple of 10, up to 100
 
 const uint32_t IR_SHIFT_MS = 3000;  // a digit within this window shifts the previous one left
 
@@ -303,19 +307,27 @@ void handleIR() {
 
   uint32_t now = millis();
 
-  if (cmd == IR_CMD_UP) {
+  if (cmd == IR_CMD_UP || cmd == IR_CMD_RIGHT) {
     lastDigitPressMs = 0;             // command keys end any digit-entry sequence
     if (counter < COUNT_MAX) counter++;
     beepStart();
-    Serial.printf("IR UP → %d\n", counter);
+    Serial.printf("IR +1 → %d\n", counter);
     return;
   }
 
-  if (cmd == IR_CMD_DOWN) {
+  if (cmd == IR_CMD_DOWN || cmd == IR_CMD_LEFT) {
     lastDigitPressMs = 0;
     if (counter > COUNT_MIN) counter--;
     beepStart();
-    Serial.printf("IR DOWN → %d\n", counter);
+    Serial.printf("IR -1 → %d\n", counter);
+    return;
+  }
+
+  if (cmd == IR_CMD_OK) {             // OK = full speed
+    lastDigitPressMs = 0;
+    counter = FAN_MAX;
+    beepStart();
+    Serial.println("IR OK → FF (full speed)");
     return;
   }
 
