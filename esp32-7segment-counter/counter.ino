@@ -46,11 +46,14 @@
  * Behaviour:
  *   - Value 0   → fan off.   Value 100 → full speed (display shows "FF").
  *   - Fan speed is proportional to the displayed value (PWM).
- *   - IR digits: two keys form 00–99 (single key + 4 s = 0X), then 4 s lockout.
+ *   - Leading zero is blanked: 0–9 show on the right digit only.
+ *   - IR digits: each press shows immediately on the right digit. A second
+ *     press within 3 s shifts the right digit to the left (e.g. 1 then 8 = 18).
+ *     After a 3 s gap, the next press starts fresh on the right digit.
  *   - IR ▲/▼: +1 / −1 (0–99).
- *   - IR * : set to 00 (fan off).
+ *   - IR * : set to 0 (fan off).
  *   - IR # : step up 10 → 20 → ... → 100 (next multiple of 10, max 100).
- *   - Physical buttons: INC +1 (max 99), DEC −1 (min 0), RST → 00.
+ *   - Physical buttons: INC +1 (max 99), DEC −1 (min 0), RST → 0.
  */
 
 #define DECODE_NEC          // restrict IRremote to NEC — saves RAM, faster
@@ -108,8 +111,7 @@ const uint8_t IR_CMD_DOWN = 0x52;   // ▼ arrow
 const uint8_t IR_CMD_STAR = 0x16;   // *  → fan off (00)
 const uint8_t IR_CMD_HASH = 0x0D;   // #  → next multiple of 10, up to 100
 
-const uint32_t IR_LOCKOUT_MS = 4000;  // digit keys ignored this long after a number is set
-const uint32_t IR_ENTRY_MS   = 4000;  // max wait for the second digit
+const uint32_t IR_SHIFT_MS = 3000;  // a digit within this window shifts the previous one left
 
 // ── 7-segment encoding ────────────────────────────────────────────────────────
 // Common cathode: bit 1 = segment ON (GPIO HIGH), bit 0 = segment OFF (GPIO LOW)
@@ -210,9 +212,7 @@ bool checkPress(Button &btn) {
 
 // ── IR remote handling ────────────────────────────────────────────────────────
 
-int      pendingTens    = -1;  // first digit of a 2-key entry, -1 = none
-uint32_t pendingMs      =  0;  // when the first digit arrived
-uint32_t lockoutUntilMs =  0;  // digit keys ignored until this time
+uint32_t lastDigitPressMs = 0;  // when the last digit key was pressed (0 = none)
 
 int digitFromCmd(uint8_t cmd) {
   for (int d = 0; d < 10; d++) {
@@ -222,55 +222,44 @@ int digitFromCmd(uint8_t cmd) {
 }
 
 void handleIR() {
-  uint32_t now = millis();
-
-  // First digit entered but second never arrived → apply it as 0X
-  if (pendingTens >= 0 && now - pendingMs >= IR_ENTRY_MS) {
-    counter = pendingTens;
-    pendingTens = -1;
-    lockoutUntilMs = now + IR_LOCKOUT_MS;
-    beepStart();
-    Serial.printf("IR single digit → %02d\n", counter);
-  }
-
   if (!IrReceiver.decode()) return;
   uint8_t cmd     = IrReceiver.decodedIRData.command;
   bool    repeat  = IrReceiver.decodedIRData.flags & IRDATA_FLAGS_IS_REPEAT;
   IrReceiver.resume();
   if (repeat) return;                 // ignore NEC held-key repeat frames
 
-  now = millis();
+  uint32_t now = millis();
 
   if (cmd == IR_CMD_UP) {
-    pendingTens = -1;                 // any command key cancels a half-entered number
+    lastDigitPressMs = 0;             // command keys end any digit-entry sequence
     if (counter < COUNT_MAX) counter++;
     beepStart();
-    Serial.printf("IR UP → %02d\n", counter);
+    Serial.printf("IR UP → %d\n", counter);
     return;
   }
 
   if (cmd == IR_CMD_DOWN) {
-    pendingTens = -1;
+    lastDigitPressMs = 0;
     if (counter > COUNT_MIN) counter--;
     beepStart();
-    Serial.printf("IR DOWN → %02d\n", counter);
+    Serial.printf("IR DOWN → %d\n", counter);
     return;
   }
 
   if (cmd == IR_CMD_STAR) {           // * = fan off
-    pendingTens = -1;
+    lastDigitPressMs = 0;
     counter = 0;
     beepStart();
-    Serial.println("IR * → 00 (fan off)");
+    Serial.println("IR * → 0 (fan off)");
     return;
   }
 
   if (cmd == IR_CMD_HASH) {           // # = next multiple of 10, max 100
-    pendingTens = -1;
+    lastDigitPressMs = 0;
     counter = min(FAN_MAX, (counter / 10 + 1) * 10);
     beepStart();
     if (counter >= FAN_MAX) Serial.println("IR # → FF (full speed)");
-    else                    Serial.printf("IR # → %02d\n", counter);
+    else                    Serial.printf("IR # → %d\n", counter);
     return;
   }
 
@@ -280,22 +269,17 @@ void handleIR() {
     return;
   }
 
-  if ((int32_t)(now - lockoutUntilMs) < 0) {
-    Serial.printf("IR digit %d ignored (4 s lockout)\n", d);
-    return;
-  }
-
-  if (pendingTens < 0) {
-    pendingTens = d;                  // first key = tens digit, wait for second
-    pendingMs   = now;
-    Serial.printf("IR first digit %d — waiting for second...\n", d);
+  // Digit entry: show immediately on the right digit. A press within 3 s of
+  // the previous digit shifts that digit to the left (1 then 8 → 18). A first
+  // digit of 0 stays 0, so 0 then 8 → 8. After 3 s of silence, start fresh.
+  if (lastDigitPressMs != 0 && now - lastDigitPressMs <= IR_SHIFT_MS) {
+    counter = (counter % 10) * 10 + d;
   } else {
-    counter = pendingTens * 10 + d;   // second key completes the number
-    pendingTens = -1;
-    lockoutUntilMs = now + IR_LOCKOUT_MS;
-    beepStart();
-    Serial.printf("IR entry → %02d\n", counter);
+    counter = d;
   }
+  lastDigitPressMs = now;
+  beepStart();
+  Serial.printf("IR digit %d → %d\n", d, counter);
 }
 
 // ── Display multiplexing ──────────────────────────────────────────────────────
@@ -327,7 +311,8 @@ void updateDisplay() {
     encTens  = SEG_F;
     encUnits = SEG_F;
   } else {
-    encTens  = SEG_MAP[counter / 10];
+    // Blank the leading zero: 0–9 show on the right digit only
+    encTens  = (counter < 10) ? 0x00 : SEG_MAP[counter / 10];
     encUnits = SEG_MAP[counter % 10];
   }
 
