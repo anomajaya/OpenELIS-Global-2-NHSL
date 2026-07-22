@@ -35,15 +35,16 @@
  *   GND/-  → GND rail
  *
  * Fan — 5V DC, simple ON/OFF (Q3 = 2N2222 / S8050 NPN):
- *   ***** WIRING CHANGE: move Q3 base wire from GPIO 2 to GPIO 27 *****
  *   VIN (5V)  → Fan (+)
  *   Fan (−)   → Q3 collector;  Q3 emitter → GND
- *   GPIO 27   → 1kΩ → Q3 base
+ *   GPIO 2    → 1kΩ → Q3 base
  *   1N4007 flyback diode ACROSS the fan: stripe (cathode) to VIN, other leg to Fan (−)
  *   The fan runs ONLY when the display shows "FF" (value 100). For 0–99 the
- *   fan pin stays LOW (fan off) to save battery.
+ *   fan pin (GPIO 2) stays LOW, so the fan draws no current — saves battery.
  *
- *   GPIO 2 (onboard blue LED) is held LOW permanently so the LED never lights.
+ *   NOTE: the onboard blue LED is on GPIO 2, the same pin as the fan, so it
+ *   is OFF for 0–99 and lights only at FF (when the fan runs). They cannot be
+ *   separated while the fan stays on GPIO 2.
  *
  * Behaviour:
  *   - Fan is OFF for values 0–99, and ON only at "FF" (full, value 100).
@@ -89,8 +90,7 @@ const uint8_t BTN_RST      = 33;
 
 const uint8_t BUZZER_PIN   = 4;
 const uint8_t IR_RECV_PIN  = 35;
-const uint8_t FAN_PIN      = 27;   // digital ON/OFF → 1kΩ → Q3 base (ON only at FF)
-const uint8_t LED_PIN      = 2;    // onboard blue LED — held LOW forever (off)
+const uint8_t FAN_PIN      = 2;    // digital ON/OFF → 1kΩ → Q3 base (ON only at FF)
 
 // ── IR remote key codes (NEC command byte) ────────────────────────────────────
 // Default map = the common 17-key kit remote (HX1838 kits, address 0x00).
@@ -354,13 +354,9 @@ void setup() {
   pinMode(BTN_DEC, INPUT_PULLUP);
   pinMode(BTN_RST, INPUT_PULLUP);
 
-  // Fan pin: plain digital output, start OFF
+  // Fan pin: plain digital output, start OFF (also keeps the onboard LED off)
   pinMode(FAN_PIN, OUTPUT);
   digitalWrite(FAN_PIN, LOW);
-
-  // Onboard blue LED: hold LOW permanently so it never lights
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
 
   // Wait for pull-ups to fully settle before first read
   delay(100);
