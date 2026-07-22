@@ -1,18 +1,9 @@
 /*
- * 2-Digit 7-Segment Counter + 5V Fan Speed Controller + OTA updates
+ * 2-Digit 7-Segment Counter + 5V Fan ON/OFF Controller (battery / IR remote)
  * ESP32-WROOM-32 DevKitC (38-pin)
  * Display: 2-digit COMMON CATHODE, red (10-pin, 5 per side)
  *
  * Requires library: "IRremote" by Armin Joachimsmeyer, version 4.x
- * (WiFi / ArduinoOTA / ESPmDNS ship with the ESP32 board package — no install)
- *
- * ── OTA updates ──────────────────────────────────────────────────────────────
- *   1. Fill in WIFI_SSID / WIFI_PASS below (and change OTA_PASSWORD).
- *   2. Flash once over USB.
- *   3. From then on: Arduino IDE → Tools → Port → pick the network port
- *      "fan-controller at 192.168.x.x" and upload wirelessly.
- *   The device works fine with no WiFi — it retries every 30 s in the
- *   background and everything else runs normally.
  *
  * Display pinout (pin 1 = bottom-left, face toward you):
  *   Pin 1  (c)    → 150Ω → GPIO 21
@@ -43,41 +34,32 @@
  *   VCC/+  → 3.3V
  *   GND/-  → GND rail
  *
- * Fan — 5V DC, PWM speed control (Q3 = 2N2222 / S8050 NPN):
+ * Fan — 5V DC, simple ON/OFF (Q3 = 2N2222 / S8050 NPN):
+ *   ***** WIRING CHANGE: move Q3 base wire from GPIO 2 to GPIO 27 *****
  *   VIN (5V)  → Fan (+)
  *   Fan (−)   → Q3 collector;  Q3 emitter → GND
- *   GPIO 2    → 1kΩ → Q3 base
+ *   GPIO 27   → 1kΩ → Q3 base
  *   1N4007 flyback diode ACROSS the fan: stripe (cathode) to VIN, other leg to Fan (−)
+ *   The fan runs ONLY when the display shows "FF" (value 100). For 0–99 the
+ *   fan pin stays LOW (fan off) to save battery.
+ *
+ *   GPIO 2 (onboard blue LED) is held LOW permanently so the LED never lights.
  *
  * Behaviour:
- *   - Value 0   → fan off.   Value 100 → full speed (display shows "FF").
- *   - Fan speed is proportional to the displayed value (PWM).
+ *   - Fan is OFF for values 0–99, and ON only at "FF" (full, value 100).
  *   - Leading zero is blanked: 0–9 show on the right digit only.
  *   - IR digits: each press shows immediately on the right digit. A second
  *     press within 3 s shifts the right digit to the left (e.g. 1 then 8 = 18).
  *     After a 3 s gap, the next press starts fresh on the right digit.
  *   - IR ▲/► : +1  and  ▼/◄ : −1 (0–99).
- *   - IR OK : FF (full speed, 100).
- *   - IR * : set to 0 (fan off).
+ *   - IR OK : FF (fan ON, value 100).
+ *   - IR * : set to 0.
  *   - IR # : step up 10 → 20 → ... → 100 (next multiple of 10, max 100).
  *   - Physical buttons: INC +1 (max 99), DEC −1 (min 0), RST → 0.
  */
 
 #define DECODE_NEC          // restrict IRremote to NEC — saves RAM, faster
 #include <IRremote.hpp>
-#include <WiFi.h>
-#include <ESPmDNS.h>
-#include <WiFiUdp.h>
-#include <ArduinoOTA.h>
-
-// ── WiFi / OTA settings — EDIT THESE ─────────────────────────────────────────
-
-const char* WIFI_SSID    = "YOUR_WIFI_NAME";      // ← your WiFi network name
-const char* WIFI_PASS    = "YOUR_WIFI_PASSWORD";  // ← your WiFi password
-const char* OTA_HOSTNAME = "fan-controller";      // name shown in the IDE port list
-const char* OTA_PASSWORD = "fan1234";             // ← change this! asked on upload
-
-const uint32_t WIFI_RETRY_MS = 30000;  // retry WiFi every 30 s if not connected
 
 // ── Structs first — Arduino IDE auto-generates prototypes before any code,
 //    so structs used in function signatures must be declared at the top. ───────
@@ -107,7 +89,8 @@ const uint8_t BTN_RST      = 33;
 
 const uint8_t BUZZER_PIN   = 4;
 const uint8_t IR_RECV_PIN  = 35;
-const uint8_t FAN_PIN      = 2;    // PWM → 1kΩ → Q3 base (LOW at boot = fan off)
+const uint8_t FAN_PIN      = 27;   // digital ON/OFF → 1kΩ → Q3 base (ON only at FF)
+const uint8_t LED_PIN      = 2;    // onboard blue LED — held LOW forever (off)
 
 // ── IR remote key codes (NEC command byte) ────────────────────────────────────
 // Default map = the common 17-key kit remote (HX1838 kits, address 0x00).
@@ -130,8 +113,8 @@ const uint8_t IR_CMD_UP    = 0x18;  // ▲ arrow → +1
 const uint8_t IR_CMD_DOWN  = 0x52;  // ▼ arrow → −1
 const uint8_t IR_CMD_RIGHT = 0x5A;  // ► arrow → +1
 const uint8_t IR_CMD_LEFT  = 0x08;  // ◄ arrow → −1
-const uint8_t IR_CMD_OK    = 0x1C;  // OK      → FF (full speed, 100)
-const uint8_t IR_CMD_STAR  = 0x16;  // *  → fan off (0)
+const uint8_t IR_CMD_OK    = 0x1C;  // OK      → FF (fan ON, 100)
+const uint8_t IR_CMD_STAR  = 0x16;  // *  → 0
 const uint8_t IR_CMD_HASH  = 0x0D;  // #  → next multiple of 10, up to 100
 
 const uint32_t IR_SHIFT_MS = 3000;  // a digit within this window shifts the previous one left
@@ -167,8 +150,8 @@ const uint8_t SEG_F = 0x71;  // letter F (a, f, g, e) — "FF" means value 100
 
 const int COUNT_MAX = 99;    // limit for +1/−1 steps (buttons and IR arrows)
 const int COUNT_MIN =  0;
-const int FAN_MAX   = 100;   // reachable only via the # key
-int counter = 0;             // 0–100; doubles as fan speed in percent
+const int FAN_MAX   = 100;   // "FF" — the only value that turns the fan ON
+int counter = 0;
 
 // ── Buzzer — non-blocking AC-remote two-phase beep ────────────────────────────
 
@@ -202,70 +185,15 @@ void beepTick() {
   ledcWriteTone(BUZZER_PIN, BEEP_SEQ[beepPhase].freq);
 }
 
-// ── Fan PWM ───────────────────────────────────────────────────────────────────
-// 25 kHz PWM — above audible range, so the fan doesn't whine.
-// Duty maps 0–100 % → 0–255. Small fans may not start below ~30 %.
+// ── Fan (simple ON/OFF) ───────────────────────────────────────────────────────
+// Fan runs only when the display shows "FF" (value 100). For 0–99 the pin is
+// LOW, so the transistor is off and the fan draws no current — saves battery.
 
 void applyFan() {
   static int lastVal = -1;
   if (counter == lastVal) return;
   lastVal = counter;
-  uint32_t duty = (uint32_t)counter * 255 / FAN_MAX;
-  ledcWrite(FAN_PIN, duty);
-}
-
-// ── WiFi + OTA (non-blocking) ─────────────────────────────────────────────────
-// The controller never waits for WiFi: it starts an attempt, keeps running,
-// and finishes OTA setup whenever the connection succeeds.
-
-bool     otaReady        = false;
-uint32_t lastWifiTryMs   = 0;
-
-void otaSetup() {
-  ArduinoOTA.setHostname(OTA_HOSTNAME);
-  ArduinoOTA.setPassword(OTA_PASSWORD);
-
-  ArduinoOTA.onStart([]() {
-    // Quiesce the hardware during the flash write
-    digitalWrite(DIGIT_TENS,  LOW);
-    digitalWrite(DIGIT_UNITS, LOW);
-    ledcWriteTone(BUZZER_PIN, 0);
-    ledcWrite(FAN_PIN, 0);
-    Serial.println("OTA: update starting");
-  });
-  ArduinoOTA.onEnd([]() {
-    Serial.println("\nOTA: done, rebooting");
-  });
-  ArduinoOTA.onProgress([](unsigned int prog, unsigned int total) {
-    static int lastPct = -1;
-    int pct = (int)(prog * 100UL / total);
-    if (pct / 10 != lastPct / 10) { Serial.printf("OTA: %d%%\n", pct); lastPct = pct; }
-  });
-  ArduinoOTA.onError([](ota_error_t err) {
-    Serial.printf("OTA error %u — device keeps old firmware\n", err);
-  });
-
-  ArduinoOTA.begin();
-  otaReady = true;
-  Serial.printf("OTA ready — hostname '%s', IP %s\n",
-                OTA_HOSTNAME, WiFi.localIP().toString().c_str());
-}
-
-void wifiTick() {
-  if (otaReady) {
-    ArduinoOTA.handle();
-    return;
-  }
-  if (WiFi.status() == WL_CONNECTED) {
-    otaSetup();
-    return;
-  }
-  if (millis() - lastWifiTryMs >= WIFI_RETRY_MS) {
-    lastWifiTryMs = millis();
-    Serial.printf("WiFi: connecting to '%s'...\n", WIFI_SSID);
-    WiFi.disconnect();
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-  }
+  digitalWrite(FAN_PIN, (counter >= FAN_MAX) ? HIGH : LOW);
 }
 
 // ── Button debounce ───────────────────────────────────────────────────────────
@@ -323,19 +251,19 @@ void handleIR() {
     return;
   }
 
-  if (cmd == IR_CMD_OK) {             // OK = full speed
+  if (cmd == IR_CMD_OK) {             // OK = FF, fan ON
     lastDigitPressMs = 0;
     counter = FAN_MAX;
     beepStart();
-    Serial.println("IR OK → FF (full speed)");
+    Serial.println("IR OK → FF (fan ON)");
     return;
   }
 
-  if (cmd == IR_CMD_STAR) {           // * = fan off
+  if (cmd == IR_CMD_STAR) {           // * = 0
     lastDigitPressMs = 0;
     counter = 0;
     beepStart();
-    Serial.println("IR * → 0 (fan off)");
+    Serial.println("IR * → 0");
     return;
   }
 
@@ -343,7 +271,7 @@ void handleIR() {
     lastDigitPressMs = 0;
     counter = min(FAN_MAX, (counter / 10 + 1) * 10);
     beepStart();
-    if (counter >= FAN_MAX) Serial.println("IR # → FF (full speed)");
+    if (counter >= FAN_MAX) Serial.println("IR # → FF (fan ON)");
     else                    Serial.printf("IR # → %d\n", counter);
     return;
   }
@@ -392,7 +320,7 @@ void updateDisplay() {
   clearSegments();
 
   uint8_t encTens, encUnits;
-  if (counter >= 100) {                // "FF" = full speed
+  if (counter >= 100) {                // "FF" = full / fan ON
     encTens  = SEG_F;
     encUnits = SEG_F;
   } else {
@@ -426,9 +354,13 @@ void setup() {
   pinMode(BTN_DEC, INPUT_PULLUP);
   pinMode(BTN_RST, INPUT_PULLUP);
 
-  // Fan PWM: 25 kHz, 8-bit — start with fan off
-  ledcAttach(FAN_PIN, 25000, 8);
-  ledcWrite(FAN_PIN, 0);
+  // Fan pin: plain digital output, start OFF
+  pinMode(FAN_PIN, OUTPUT);
+  digitalWrite(FAN_PIN, LOW);
+
+  // Onboard blue LED: hold LOW permanently so it never lights
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
 
   // Wait for pull-ups to fully settle before first read
   delay(100);
@@ -452,16 +384,9 @@ void setup() {
                 digitalRead(BTN_INC), digitalRead(BTN_DEC), digitalRead(BTN_RST));
   Serial.println("(1=idle  0=stuck-low or pressed)");
 
-  // Start WiFi in the background — wifiTick() finishes OTA setup once connected
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);              // keeps OTA discovery responsive
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  lastWifiTryMs = millis();
-  Serial.printf("WiFi: connecting to '%s' (non-blocking)...\n", WIFI_SSID);
-
   IrReceiver.begin(IR_RECV_PIN, DISABLE_LED_FEEDBACK);
   Serial.printf("IR receiver listening on GPIO %d\n", IR_RECV_PIN);
-  Serial.printf("Fan PWM on GPIO %d (25 kHz)\n", FAN_PIN);
+  Serial.printf("Fan (ON only at FF) on GPIO %d\n", FAN_PIN);
 
   // ── Segment scan: light each GPIO one at a time for 800 ms ──────────────
   // Enable both digit drivers so you can see which physical segment lights up
@@ -485,7 +410,6 @@ void loop() {
   beepTick();
   handleIR();
   applyFan();
-  wifiTick();
 
   if (checkPress(btnInc)) { if (counter < COUNT_MAX) counter++; beepStart(); Serial.printf("INC → %d\n", counter); }
   if (checkPress(btnDec)) { if (counter > COUNT_MIN) counter--; beepStart(); Serial.printf("DEC → %d\n", counter); }
